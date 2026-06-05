@@ -50,11 +50,14 @@ def muller_brown_potential(x, y):
 
     V = np.zeros_like(x)
     for k in range(4):
-        V += A[k] * np.exp(
+        arg = (
             a[k] * (x - x0[k]) ** 2
             + b[k] * (x - x0[k]) * (y - y0[k])
             + c[k] * (y - y0[k]) ** 2
         )
+        # Clip to prevent overflow (exp(>700) → inf in float64)
+        arg = np.clip(arg, -500, 100)
+        V += A[k] * np.exp(arg)
     return V
 
 
@@ -211,19 +214,35 @@ def swarm_of_trajectories(V_func, start, n_swarm=20, n_steps=2000, temp=0.3):
     all_paths = []
     end_points = []
 
+    # Finite-difference epsilon and gradient buffer
+    eps_fd = 1e-4  # coarser mesh: more stable against extreme potential values
+    grad_buf = 0.3  # stay inside bounds for finite-difference stencil
+
+    x_min, x_max = -1.5, 1.2
+    y_min, y_max = -0.5, 2.0
+
     for s in range(n_swarm):
-        # Initialize near start with slight perturbation
+        # Initialize near start with slight perturbation, clamped to bounds
         pos = start + rng.normal(0, 0.05, 2)
+        pos[0] = np.clip(pos[0], x_min + grad_buf, x_max - grad_buf)
+        pos[1] = np.clip(pos[1], y_min + grad_buf, y_max - grad_buf)
         path = [pos.copy()]
 
         for _ in range(n_steps):
-            # Gradient
-            eps = 1e-5
-            gx = (V_func(pos[0] + eps, pos[1]) - V_func(pos[0] - eps, pos[1])) / (2 * eps)
-            gy = (V_func(pos[0], pos[1] + eps) - V_func(pos[0], pos[1] - eps)) / (2 * eps)
+            # Gradient with safe finite difference
+            x, y = pos[0], pos[1]
+            xp = np.clip(x + eps_fd, x_min, x_max)
+            xn = np.clip(x - eps_fd, x_min, x_max)
+            yp = np.clip(y + eps_fd, y_min, y_max)
+            yn = np.clip(y - eps_fd, y_min, y_max)
+            gx = (V_func(xp, y) - V_func(xn, y)) / max(xp - xn, 1e-10)
+            gy = (V_func(x, yp) - V_func(x, yn)) / max(yp - yn, 1e-10)
 
             noise = rng.normal(0, noise_scale, 2)
             pos = pos - np.array([gx, gy]) * dt + noise
+            # Reflect at boundaries
+            pos[0] = np.clip(pos[0], x_min + grad_buf, x_max - grad_buf)
+            pos[1] = np.clip(pos[1], y_min + grad_buf, y_max - grad_buf)
             path.append(pos.copy())
 
         all_paths.append(np.array(path))
