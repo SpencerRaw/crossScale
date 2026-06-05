@@ -368,6 +368,9 @@ def _run_bo_simple(X, y, models, feature_names):
 def _run_bo_botorch(X, y, models, feature_names):
     """BoTorch-based BO (if library available)."""
     import torch
+    from botorch.models import SingleTaskGP
+    from botorch.acquisition import UpperConfidenceBound
+    from botorch.optim import optimize_acqf
 
     y_obj = y[:, 0] * y[:, 2]  # objective
 
