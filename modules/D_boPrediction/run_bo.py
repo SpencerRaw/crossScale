@@ -300,22 +300,29 @@ def run_bayesian_optimization(X, y, models, feature_names):
         return _run_bo_simple(X, y, models, feature_names)
 
 
+def _bo_objective(loading, release, stability):
+    """Multi-objective: high loading × stability with release in sweet spot."""
+    release_ok = np.exp(-((release - 0.55) ** 2) / 0.06)
+    return loading * stability * release_ok
+
+
 def _run_bo_simple(X, y, models, feature_names):
     """
     Simple GP-based Bayesian optimization with input normalisation.
 
-    Objective: maximize loading_efficiency × structural_stability
-              while keeping release_rate in target range.
+    Objective: loading × stability × release_sweet_spot  (all [0,1]).
     """
     rng = np.random.RandomState(99)
 
-    y_obj = y[:, 0] * y[:, 2]  # loading × stability
+    # Compute objective for the full dataset (find baseline)
+    y_obj_full = _bo_objective(y[:, 0], y[:, 1], y[:, 2])
+    data_best = y_obj_full.max()
+    data_best_idx = y_obj_full.argmax()
 
     n_features = X.shape[1]
     # ── Global min-max bounds for the design space ──
     x_min = X.min(axis=0)
     x_max = X.max(axis=0)
-    # Normalise everything to [0, 1]
     def normalise(x):
         return (x - x_min) / (x_max - x_min + 1e-10)
     def denormalise(xn):
@@ -323,23 +330,23 @@ def _run_bo_simple(X, y, models, feature_names):
 
     X_norm_global = normalise(X)
 
-    # ── Initial samples: random over the space ──
+    # ── Initial samples: diverse random points ──
     n_init = 20
     init_idx = rng.choice(len(X), n_init, replace=False)
     X_tested = X_norm_global[init_idx].copy()
-    y_tested = y_obj[init_idx].copy()
+    y_tested = y_obj_full[init_idx].copy()
 
     best_y = y_tested.max()
     best_x_norm = X_tested[y_tested.argmax()].copy()
 
     history = [best_y]
     n_iter = 100
-    n_candidates = 5000
-    gp_ls = 0.3  # RBF lengthscale in normalised space
+    n_candidates = 8000
+    gp_ls = 0.25  # RBF lengthscale in normalised space
 
     for iteration in range(n_iter):
         # Adaptive UCB beta: start explorative, become exploitative
-        beta = 3.0 * (1.0 - 0.7 * iteration / n_iter)
+        beta = 3.0 * (1.0 - 0.8 * iteration / n_iter)
 
         # Generate candidates in normalised space
         cand_norm = rng.uniform(0, 1, (n_candidates, n_features))
@@ -367,8 +374,9 @@ def _run_bo_simple(X, y, models, feature_names):
         # Evaluate candidate using trained XGBoost models
         new_features = denormalise(best_cand_norm.reshape(1, -1))
         pred_loading = models[0].predict(new_features)[0]
+        pred_release = models[1].predict(new_features)[0]
         pred_stability = models[2].predict(new_features)[0]
-        new_y = pred_loading * pred_stability
+        new_y = _bo_objective(pred_loading, pred_release, pred_stability)
 
         X_tested = np.vstack([X_tested, best_cand_norm])
         y_tested = np.append(y_tested, new_y)
@@ -383,7 +391,9 @@ def _run_bo_simple(X, y, models, feature_names):
             print(f"  BO iter {iteration:3d}: best = {best_y:.4f}, beta = {beta:.2f}")
 
     best_x = denormalise(best_x_norm)
-    print(f"\n  Best objective: {best_y:.4f}")
+    improvement = best_y - data_best
+    print(f"\n  Data best objective:  {data_best:.4f}")
+    print(f"  BO best objective:    {best_y:.4f}  (Δ = {improvement:+.4f})")
     print(f"  Best parameters: {dict(zip(feature_names, best_x.round(4)))}")
 
     bx = best_x.reshape(1, -1)
@@ -396,7 +406,7 @@ def _run_bo_simple(X, y, models, feature_names):
 
 
 def _run_bo_botorch(X, y, models, feature_names):
-    """BoTorch-based BO with normalised inputs and more iterations."""
+    """BoTorch-based BO with normalised inputs and multi-objective."""
     import torch
     import warnings
     from botorch.models import SingleTaskGP
@@ -406,7 +416,8 @@ def _run_bo_botorch(X, y, models, feature_names):
     # Suppress BoTorch input warnings
     warnings.filterwarnings("ignore", category=UserWarning, module="botorch")
 
-    y_obj = y[:, 0] * y[:, 2]  # objective
+    y_obj_full = _bo_objective(y[:, 0], y[:, 1], y[:, 2])
+    data_best = y_obj_full.max()
 
     n_features = X.shape[1]
     x_min = X.min(axis=0)
@@ -422,7 +433,7 @@ def _run_bo_botorch(X, y, models, feature_names):
     rng = np.random.RandomState(99)
     init_idx = rng.choice(len(X_norm), 20, replace=False)
     X_t = torch.tensor(X_norm[init_idx], dtype=torch.float64)
-    y_t = torch.tensor(y_obj[init_idx], dtype=torch.float64).reshape(-1, 1)
+    y_t = torch.tensor(y_obj_full[init_idx], dtype=torch.float64).reshape(-1, 1)
 
     best_y = y_t.max().item()
     best_x_norm = X_t[y_t.argmax()].clone()
@@ -430,7 +441,7 @@ def _run_bo_botorch(X, y, models, feature_names):
 
     for iteration in range(80):
         model = SingleTaskGP(X_t, y_t)
-        beta = 3.0 * (1.0 - 0.7 * iteration / 80)
+        beta = 3.0 * (1.0 - 0.8 * iteration / 80)
         acq = UpperConfidenceBound(model, beta=beta)
 
         candidate, _ = optimize_acqf(
@@ -441,8 +452,9 @@ def _run_bo_botorch(X, y, models, feature_names):
         cand_np = candidate.numpy().flatten() * (x_max - x_min) + x_min
         with torch.no_grad():
             pred_loading = models[0].predict(cand_np.reshape(1, -1))[0]
+            pred_release = models[1].predict(cand_np.reshape(1, -1))[0]
             pred_stability = models[2].predict(cand_np.reshape(1, -1))[0]
-        new_y = pred_loading * pred_stability
+        new_y = _bo_objective(pred_loading, pred_release, pred_stability)
 
         X_t = torch.cat([X_t, candidate])
         y_t = torch.cat([y_t, torch.tensor([[new_y]], dtype=torch.float64)])
@@ -456,6 +468,10 @@ def _run_bo_botorch(X, y, models, feature_names):
             print(f"  BO iter {iteration:3d}: best = {best_y:.4f}, beta = {beta:.2f}")
 
     best_x = best_x_norm.numpy().flatten() * (x_max - x_min) + x_min
+    improvement = best_y - data_best
+    print(f"\n  Data best objective:  {data_best:.4f}")
+    print(f"  BO best objective:    {best_y:.4f}  (Δ = {improvement:+.4f})")
+
     preds = [m.predict(best_x.reshape(1, -1))[0] for m in models]
     return history, best_x, preds
 

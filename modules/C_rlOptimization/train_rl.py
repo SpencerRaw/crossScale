@@ -141,7 +141,7 @@ def composition_penalty(sequence):
     n = len(seq)
     bc = np.bincount(seq, minlength=20)
     max_frac = bc.max() / n
-    aa_bias = max(0.0, max_frac - 0.30) * 8.0
+    aa_bias = max(0.0, max_frac - 0.30) * 2.0
 
     # Class coverage: penalise missing major classes
     hydrophobic = np.isin(seq, [0, 9, 10, 12, 13, 14, 17, 18, 19])
@@ -267,12 +267,16 @@ class SimplePPO:
     def update(self, states, actions, old_log_probs, returns, advantages):
         batch_size = len(states)
         clip_eps = 0.2
+        max_grad_norm = 1.0
 
         for i in range(batch_size):
             s, a, old_lp, ret, adv = (
                 states[i], actions[i], old_log_probs[i],
                 returns[i], advantages[i],
             )
+            # Clip extreme advantage values to prevent gradient explosion
+            adv = np.clip(adv, -5.0, 5.0)
+
             probs, value, (h1, h2) = self.forward(s)
             new_lp = np.log(probs[a] + 1e-10)
             ratio = np.exp(np.clip(new_lp - old_lp, -10, 10))
@@ -286,25 +290,34 @@ class SimplePPO:
             grad_logits *= policy_gain
 
             # Entropy bonus: -grad(H) encourages exploration
-            ent = -(probs * np.log(probs + 1e-10)).sum()
             grad_logits += self.ent_coef * probs * (np.log(probs + 1e-10) + 1)
+            # Clip logits gradient
+            gn = np.sqrt((grad_logits ** 2).sum()) + 1e-10
+            if gn > max_grad_norm:
+                grad_logits *= max_grad_norm / gn
 
             self.W_pi -= self.lr * np.outer(h2, grad_logits)
             self.b_pi -= self.lr * grad_logits
 
-            # Value gradient
-            v_err = value - ret
+            # Value gradient (clipped)
+            v_err = np.clip(value - ret, -5.0, 5.0)
             self.W_v -= self.lr * v_err * h2.reshape(-1, 1)
             self.b_v -= self.lr * v_err
 
             # Shared layers
             grad_h2 = self.W_pi @ grad_logits + self.W_v.flatten() * v_err
             grad_h2[h2 <= 0] = 0
+            gn_h2 = np.sqrt((grad_h2 ** 2).sum()) + 1e-10
+            if gn_h2 > max_grad_norm:
+                grad_h2 *= max_grad_norm / gn_h2
             self.W2 -= self.lr * np.outer(h1, grad_h2)
             self.b2 -= self.lr * grad_h2
 
             grad_h1 = self.W2 @ grad_h2
             grad_h1[h1 <= 0] = 0
+            gn_h1 = np.sqrt((grad_h1 ** 2).sum()) + 1e-10
+            if gn_h1 > max_grad_norm:
+                grad_h1 *= max_grad_norm / gn_h1
             self.W1 -= self.lr * np.outer(s, grad_h1)
             self.b1 -= self.lr * grad_h1
 
@@ -322,7 +335,7 @@ def train_ppo(n_episodes=5000):
     """Train PPO agent on 20-letter MJ sequence optimisation."""
     print("Training PPO agent (20-letter MJ, 16-residue chain) …")
     env = SequenceEnvironment(CHAIN_LENGTH)
-    agent = SimplePPO(state_dim=7, n_actions=N_ACTIONS, lr=0.003)
+    agent = SimplePPO(state_dim=7, n_actions=N_ACTIONS, lr=0.001)
 
     episode_rewards = []
     best_reward = -float("inf")
