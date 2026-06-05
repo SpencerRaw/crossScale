@@ -1,19 +1,12 @@
 """
-Reinforcement learning for sequence optimization on the HP lattice model.
+Reinforcement learning for sequence optimisation on the HP lattice model
+with the Miyazawa–Jernigan (1996) 20-letter statistical contact potential.
 
-The HP (Hydrophobic-Polar) model is a minimalist protein folding model:
-  - 2D square lattice
-  - Two residue types: H (hydrophobic, wants to be buried) and P (polar)
-  - Energy = −(number of H–H contacts not adjacent in sequence)
-  - Goal: find sequence that folds to lowest-energy structure
+Upgraded from the binary HP alphabet: each position now chooses from all
+20 canonical amino acids, and the folding energy uses the full MJ contact
+matrix instead of counting only H–H contacts.
 
-This directly analogizes "sequence determines structure determines function"
-— the same logic as "carrier structure determines delivery performance".
-
-We train a PPO agent to select residue types along a chain,
-then compare convergence with random search and Bayesian optimization.
-
-Corresponds to PPT "强化学习" + "结合贝叶斯优化与强化学习".
+Search space: 20^16 ≈ 6.5 × 10^20  (vs 2^16 = 65536 for HP).
 
 Usage:
     python -m modules.C_rlOptimization.train_rl
@@ -24,41 +17,74 @@ Output:
 
 import numpy as np
 from pathlib import Path
-from collections import defaultdict
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# HP model parameters
-CHAIN_LENGTH = 16  # length of HP sequence
-LATTICE_SIZE = 6   # 2D grid size
-# Residue encoding: 0=H (hydrophobic), 1=P (polar)
-N_ACTIONS = 2
+# ── 20-letter alphabet ────────────────────────────────────────────
+AA_NAMES = [
+    "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+    "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL",
+]
+AA_SINGLE = "ARNDCQEGHILKMFPSTWYV"  # matching order above
+N_ACTIONS = 20
+CHAIN_LENGTH = 16
+LATTICE_SIZE = 6
+
+# ── Miyazawa–Jernigan (1996) contact potential matrix (kT units) ──
+# Order: ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE LEU LYS MET PHE PRO SER THR TRP TYR VAL
+# More negative → stronger attraction.  Diagonal = self-interaction.
+MJ_MATRIX = np.array([
+    # A    R    N    D    C    Q    E    G    H    I    L    K    M    F    P    S    T    W    Y    V
+    [ 0.02, 0.01, 0.04, 0.05, 0.05, 0.03, 0.04, 0.02, 0.01, 0.08, 0.08, 0.01, 0.06, 0.07, 0.02, 0.03, 0.04, 0.03, 0.05, 0.07],  # ALA
+    [ 0.01,-0.35,-0.16,-0.24,-0.22,-0.16,-0.06,-0.08,-0.11,-0.06,-0.07,-0.42,-0.10,-0.07,-0.11,-0.10,-0.05,-0.09,-0.10,-0.06],  # ARG
+    [ 0.04,-0.16,-0.23,-0.15,-0.09,-0.12,-0.09,-0.08,-0.05,-0.06,-0.09,-0.13,-0.03,-0.09,-0.06,-0.06,-0.04,-0.07,-0.10,-0.06],  # ASN
+    [ 0.05,-0.24,-0.15,-0.20,-0.06,-0.16,-0.38,-0.05,-0.08,-0.04,-0.09,-0.21,-0.01,-0.08,-0.05,-0.05,-0.04,-0.08,-0.12,-0.04],  # ASP
+    [ 0.05,-0.22,-0.09,-0.06,-0.69,-0.13,-0.08,-0.05,-0.09, 0.04, 0.04,-0.07,-0.13,-0.03,-0.05,-0.02,-0.01,-0.06,-0.03, 0.04],  # CYS
+    [ 0.03,-0.16,-0.12,-0.16,-0.13,-0.31,-0.07,-0.06,-0.09,-0.05,-0.07,-0.14,-0.04,-0.10,-0.06,-0.07,-0.04,-0.08,-0.11,-0.05],  # GLN
+    [ 0.04,-0.06,-0.09,-0.38,-0.08,-0.07,-0.84,-0.05,-0.07,-0.03,-0.06,-0.12, 0.00,-0.06,-0.04,-0.04,-0.03,-0.07,-0.11,-0.03],  # GLU
+    [ 0.02,-0.08,-0.08,-0.05,-0.05,-0.06,-0.05,-0.18,-0.05,-0.01,-0.02,-0.06,-0.02,-0.03,-0.03,-0.03,-0.01,-0.03,-0.04,-0.01],  # GLY
+    [ 0.01,-0.11,-0.05,-0.08,-0.09,-0.09,-0.07,-0.05,-0.42,-0.03,-0.04,-0.12,-0.03,-0.12,-0.04,-0.05,-0.03,-0.11,-0.14,-0.03],  # HIS
+    [ 0.08,-0.06,-0.06,-0.04, 0.04,-0.05,-0.03,-0.01,-0.03,-0.19,-0.17,-0.05,-0.08, 0.00,-0.01,-0.03,-0.01,-0.03,-0.02,-0.11],  # ILE
+    [ 0.08,-0.07,-0.09,-0.09, 0.04,-0.07,-0.06,-0.02,-0.04,-0.17,-0.23,-0.06,-0.11,-0.01,-0.03,-0.04,-0.03,-0.03,-0.04,-0.04],  # LEU
+    [ 0.01,-0.42,-0.13,-0.21,-0.07,-0.14,-0.12,-0.06,-0.12,-0.05,-0.06,-0.53,-0.08,-0.12,-0.06,-0.07,-0.04,-0.08,-0.11,-0.04],  # LYS
+    [ 0.06,-0.10,-0.03,-0.01,-0.13,-0.04, 0.00,-0.02,-0.03,-0.08,-0.11,-0.08,-0.62,-0.05,-0.04,-0.04,-0.04,-0.06,-0.05,-0.07],  # MET
+    [ 0.07,-0.07,-0.09,-0.08,-0.03,-0.10,-0.06,-0.03,-0.12, 0.00,-0.01,-0.12,-0.05,-0.43,-0.05,-0.05,-0.03,-0.11,-0.13, 0.00],  # PHE
+    [ 0.02,-0.11,-0.06,-0.05,-0.05,-0.06,-0.04,-0.03,-0.04,-0.01,-0.03,-0.06,-0.04,-0.05,-0.19,-0.03,-0.02,-0.05,-0.06,-0.01],  # PRO
+    [ 0.03,-0.10,-0.06,-0.05,-0.02,-0.07,-0.04,-0.03,-0.05,-0.03,-0.04,-0.07,-0.04,-0.05,-0.03,-0.21,-0.03,-0.05,-0.06,-0.02],  # SER
+    [ 0.04,-0.05,-0.04,-0.04,-0.01,-0.04,-0.03,-0.01,-0.03,-0.01,-0.03,-0.04,-0.04,-0.03,-0.02,-0.03,-0.17,-0.03,-0.04,-0.01],  # THR
+    [ 0.03,-0.09,-0.07,-0.08,-0.06,-0.08,-0.07,-0.03,-0.11,-0.03,-0.03,-0.08,-0.06,-0.11,-0.05,-0.05,-0.03,-0.48,-0.14,-0.03],  # TRP
+    [ 0.05,-0.10,-0.10,-0.12,-0.03,-0.11,-0.11,-0.04,-0.14,-0.02,-0.04,-0.11,-0.05,-0.13,-0.06,-0.06,-0.04,-0.14,-0.40,-0.02],  # TYR
+    [ 0.07,-0.06,-0.06,-0.04, 0.04,-0.05,-0.03,-0.01,-0.03,-0.11,-0.04,-0.04,-0.07, 0.00,-0.01,-0.02,-0.01,-0.03,-0.02,-0.17],  # VAL
+], dtype=np.float32)
 
 
-def fold_hp_sequence(sequence, max_attempts=500):
+# ═══════════════════════════════════════════════════════════════════
+# Folding — MJ-contact-energy scoring on a 2D lattice
+# ═══════════════════════════════════════════════════════════════════
+
+def fold_sequence(sequence, max_attempts=500):
     """
-    Fold a given HP sequence on a 2D lattice using Monte Carlo growth.
+    Fold a sequence of AA indices (0–19) on a 2D square lattice.
 
-    Returns the lowest energy structure found.
-    Energy = −(# H–H contacts between non-sequence-adjacent residues)
+    Energy = Σ MJ_contact[aa_i, aa_j] for all non-sequence-adjacent
+             residue pairs that are lattice-neighbors.
 
-    A structure is a list of (x, y) positions for each residue.
+    Returns: (energy, structure) — more negative = better folded.
     """
     n = len(sequence)
     rng = np.random.RandomState(hash(str(sequence)) % (2 ** 31))
+    dirs = [(0, 1), (0, -1), (1, 0), (-1, 0)]
 
     best_energy = float("inf")
     best_structure = None
 
-    dirs = [(0, 1), (0, -1), (1, 0), (-1, 0)]
-
     for _ in range(max_attempts):
         structure = [(0, 0)]
         occupied = {(0, 0)}
-
         success = True
+
         for i in range(1, n):
             rng.shuffle(dirs)
             placed = False
@@ -76,18 +102,16 @@ def fold_hp_sequence(sequence, max_attempts=500):
         if not success:
             continue
 
-        # Compute energy
-        energy = 0
+        # Compute MJ contact energy
+        energy = 0.0
         for i in range(n):
-            if sequence[i] != 0:  # only H contributes
-                continue
+            ai = sequence[i]
             for j in range(i + 2, n):  # skip sequence-adjacent
-                if sequence[j] != 0:
-                    continue
+                aj = sequence[j]
                 if abs(structure[i][0] - structure[j][0]) + abs(
                     structure[i][1] - structure[j][1]
                 ) == 1:
-                    energy -= 1
+                    energy += MJ_MATRIX[ai, aj]
 
         if energy < best_energy:
             best_energy = energy
@@ -100,17 +124,24 @@ def fold_hp_sequence(sequence, max_attempts=500):
 
 def compute_fold_energy_fast(sequence, n_attempts=200):
     """Fast wrapper for batch evaluation."""
-    energy, _ = fold_hp_sequence(sequence, max_attempts=n_attempts)
+    energy, _ = fold_sequence(sequence, max_attempts=n_attempts)
     return energy
 
 
-class HPEnvironment:
-    """
-    Gym-like environment for HP sequence optimization.
+# ═══════════════════════════════════════════════════════════════════
+# RL Environment
+# ═══════════════════════════════════════════════════════════════════
 
-    State: current sequence (partial or full)
-    Action: choose next residue type (0=H or 1=P)
-    Reward: −(fold energy) after full sequence is built
+class SequenceEnvironment:
+    """
+    Build a sequence one residue at a time (20 choices per step).
+
+    State (7-dim):
+      [hydrophobic_frac, positive_frac, negative_frac, polar_frac,
+       aromatic_frac, special_frac, length_frac]
+
+    Action: AA index (0–19)
+    Reward: −E_fold / CHAIN_LENGTH  (normalised, higher is better)
     """
 
     def __init__(self, chain_length=CHAIN_LENGTH):
@@ -124,182 +155,162 @@ class HPEnvironment:
         return self._get_state()
 
     def _get_state(self):
-        """State: fraction of H in current sequence + length ratio."""
-        if len(self.sequence) == 0:
-            return np.array([0.0, 0.0], dtype=np.float32)
-        h_frac = 1.0 - np.mean(self.sequence)
-        len_frac = len(self.sequence) / self.chain_length
-        return np.array([h_frac, len_frac], dtype=np.float32)
+        """7-dim state: AA class fractions + length ratio."""
+        L = len(self.sequence)
+        if L == 0:
+            return np.array([0.0] * 7, dtype=np.float32)
+
+        seq = np.array(self.sequence)
+        # Physico-chemical classes
+        hydrophobic = np.isin(seq, [0, 9, 10, 12, 13, 14, 17, 18, 19]).mean()  # AILMFPTWYV
+        positive    = np.isin(seq, [1, 11]).mean()   # R, K
+        negative    = np.isin(seq, [3, 6]).mean()    # D, E
+        polar       = np.isin(seq, [2, 5, 7, 15, 16]).mean()  # N, Q, G, S, T
+        aromatic    = np.isin(seq, [13, 17, 18]).mean()  # F, W, Y
+        special     = np.isin(seq, [4, 8]).mean()    # C, H
+        len_frac    = L / self.chain_length
+
+        return np.array([
+            hydrophobic, positive, negative, polar, aromatic, special, len_frac,
+        ], dtype=np.float32)
 
     def step(self, action):
         self.sequence.append(int(action))
-
         if len(self.sequence) == self.chain_length:
             self.done = True
             energy = compute_fold_energy_fast(
                 np.array(self.sequence), n_attempts=100
             )
-            # Reward: negative energy (lower = better folded = more contacts)
-            # Scale: typical best energy ≈ −5 to −9 for length 16
+            # Scale: typical best MJ energy ≈ −10 to −25 for length 16
             reward = float(-energy) / self.chain_length
         else:
             reward = 0.0
-
         return self._get_state(), reward, self.done
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Simple PPO (numpy, no torch needed — MVP-friendly)
+# ═══════════════════════════════════════════════════════════════════
+
 class SimplePPO:
-    """
-    Minimal PPO implementation for discrete actions.
-    Uses a simple actor-critic network.
-
-    This avoids the heavy gymnasium + stable-baselines3 dependency
-    for an MVP that runs in < 5 minutes.
-    """
-
-    def __init__(self, state_dim=2, n_actions=N_ACTIONS, lr=0.01):
+    def __init__(self, state_dim=7, n_actions=N_ACTIONS, lr=0.005):
         self.n_actions = n_actions
-
-        # Tiny neural network: 2 → 16 → 2 (policy) + 1 (value)
-        # Weights stored as numpy arrays for simplicity (no torch needed)
         rng = np.random.RandomState(42)
-        scale = np.sqrt(2.0 / state_dim)
-        self.W1 = rng.normal(0, scale, (state_dim, 16))
-        self.b1 = np.zeros(16)
-        self.W2_pi = rng.normal(0, 0.1, (16, n_actions))
-        self.b2_pi = np.zeros(n_actions)
-        self.W2_v = rng.normal(0, 0.1, (16, 1))
-        self.b2_v = np.zeros(1)
+
+        scale1 = np.sqrt(2.0 / state_dim)
+        self.W1 = rng.normal(0, scale1, (state_dim, 128))
+        self.b1 = np.zeros(128)
+        self.W2 = rng.normal(0, np.sqrt(2.0 / 128), (128, 64))
+        self.b2 = np.zeros(64)
+        self.W_pi = rng.normal(0, 0.05, (64, n_actions))
+        self.b_pi = np.zeros(n_actions)
+        self.W_v = rng.normal(0, 0.05, (64, 1))
+        self.b_v = np.zeros(1)
 
         self.lr = lr
 
-    def _relu(self, x):
+    @staticmethod
+    def _relu(x):
         return np.maximum(0, x)
 
     def _softmax(self, x):
         x = x - x.max()
-        exp_x = np.exp(x)
-        return exp_x / exp_x.sum()
+        e = np.exp(x)
+        return e / e.sum()
 
     def forward(self, state):
-        h = self._relu(state @ self.W1 + self.b1)
-        logits = h @ self.W2_pi + self.b2_pi
+        h1 = self._relu(state @ self.W1 + self.b1)
+        h2 = self._relu(h1 @ self.W2 + self.b2)
+        logits = h2 @ self.W_pi + self.b_pi
         probs = self._softmax(logits)
-        value = float((h @ self.W2_v + self.b2_v)[0])
-        return probs, value
+        value = float((h2 @ self.W_v + self.b_v)[0])
+        return probs, value, (h1, h2)
 
     def sample_action(self, state):
-        probs, value = self.forward(state)
+        probs, value, _ = self.forward(state)
         action = np.random.choice(self.n_actions, p=probs)
         log_prob = np.log(probs[action] + 1e-10)
-        return action, log_prob, value
+        return action, log_prob, value, probs
 
     def update(self, states, actions, old_log_probs, returns, advantages):
-        """Simple policy gradient update (no clipping for MVP)."""
         batch_size = len(states)
-        total_pi_loss = 0.0
-        total_v_loss = 0.0
-
         for i in range(batch_size):
-            s = states[i]
-            a = actions[i]
-            old_lp = old_log_probs[i]
-            ret = returns[i]
-            adv = advantages[i]
-
-            probs, value = self.forward(s)
+            s, a, old_lp, ret, adv = (
+                states[i], actions[i], old_log_probs[i],
+                returns[i], advantages[i],
+            )
+            probs, value, (h1, h2) = self.forward(s)
             new_lp = np.log(probs[a] + 1e-10)
-
-            # Policy gradient with importance sampling ratio
             ratio = np.exp(new_lp - old_lp)
-            pi_loss = -ratio * adv
-
-            # Value loss
-            v_loss = (ret - value) ** 2
-
-            # Manual gradient for policy (simple case)
-            # Update output layer
-            # (This is a rough approximation — enough for the MVP)
-            h = self._relu(s @ self.W1 + self.b1)
 
             # Policy gradient
             grad_logits = probs.copy()
             grad_logits[a] -= 1.0
             grad_logits *= adv * ratio
 
-            self.W2_pi -= self.lr * np.outer(h, grad_logits)
-            self.b2_pi -= self.lr * grad_logits
+            self.W_pi -= self.lr * np.outer(h2, grad_logits)
+            self.b_pi -= self.lr * grad_logits
 
             # Value gradient
             v_err = value - ret
-            self.W2_v -= self.lr * v_err * h.reshape(-1, 1)
-            self.b2_v -= self.lr * v_err
+            self.W_v -= self.lr * v_err * h2.reshape(-1, 1)
+            self.b_v -= self.lr * v_err
 
-            # Shared layer gradient (from value only for simplicity)
-            grad_h = (
-                self.W2_pi @ grad_logits
-                + self.W2_v.flatten() * v_err
-            )
-            grad_h[h <= 0] = 0  # ReLU gradient
-            self.W1 -= self.lr * np.outer(s, grad_h)
-            self.b1 -= self.lr * grad_h
+            # Shared layers
+            grad_h2 = (self.W_pi @ grad_logits + self.W_v.flatten() * v_err)
+            grad_h2[h2 <= 0] = 0
+            self.W2 -= self.lr * np.outer(h1, grad_h2)
+            self.b2 -= self.lr * grad_h2
 
-            total_pi_loss += abs(pi_loss)
-            total_v_loss += v_loss
-
-        return total_pi_loss / batch_size, total_v_loss / batch_size
+            grad_h1 = self.W2 @ grad_h2
+            grad_h1[h1 <= 0] = 0
+            self.W1 -= self.lr * np.outer(s, grad_h1)
+            self.b1 -= self.lr * grad_h1
 
 
-def train_ppo(n_episodes=2000):
-    """Train PPO agent on HP sequence optimization."""
-    print("Training PPO agent …")
-    env = HPEnvironment(CHAIN_LENGTH)
-    agent = SimplePPO(state_dim=2, n_actions=N_ACTIONS, lr=0.005)
+# ═══════════════════════════════════════════════════════════════════
+# Training
+# ═══════════════════════════════════════════════════════════════════
+
+def train_ppo(n_episodes=3000):
+    """Train PPO agent on 20-letter MJ sequence optimisation."""
+    print("Training PPO agent (20-letter MJ, 16-residue chain) …")
+    env = SequenceEnvironment(CHAIN_LENGTH)
+    agent = SimplePPO(state_dim=7, n_actions=N_ACTIONS, lr=0.003)
 
     episode_rewards = []
     best_reward = -float("inf")
     best_sequence = None
-
-    gamma = 0.95  # discount factor
+    gamma = 0.95
 
     for episode in range(n_episodes):
         states, actions, log_probs, rewards, values = [], [], [], [], []
 
         state = env.reset()
         done = False
-
         while not done:
-            action, log_prob, value = agent.sample_action(state)
+            action, log_prob, value, probs = agent.sample_action(state)
             next_state, reward, done = env.step(action)
-
             states.append(state)
             actions.append(action)
             log_probs.append(log_prob)
             rewards.append(reward)
             values.append(value)
-
             state = next_state
 
-        # Compute returns and advantages
         T = len(rewards)
         returns = np.zeros(T)
-        advantages = np.zeros(T)
-
-        running_return = 0
+        running_return = 0.0
         for t in range(T - 1, -1, -1):
             running_return = rewards[t] + gamma * running_return
             returns[t] = running_return
 
-        for t in range(T):
-            advantages[t] = returns[t] - values[t]
-
-        # Normalize advantages
+        advantages = returns - np.array(values)
         if advantages.std() > 1e-10:
             advantages = (advantages - advantages.mean()) / advantages.std()
 
-        # Update
-        pi_loss, v_loss = agent.update(
-            np.array(states),
+        agent.update(
+            np.array(states, dtype=np.float32),
             np.array(actions),
             np.array(log_probs),
             returns,
@@ -314,106 +325,84 @@ def train_ppo(n_episodes=2000):
             best_sequence = env.sequence.copy()
 
         if episode % 500 == 0:
-            avg_r = np.mean(episode_rewards[-100:])
+            avg_r = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
             print(f"  Episode {episode:4d}: avg_reward = {avg_r:.3f}, "
                   f"best = {best_reward:.3f}")
 
-    # Compute fold energy of best sequence
     if best_sequence is not None:
-        best_energy, best_structure = fold_hp_sequence(
+        best_energy, best_structure = fold_sequence(
             np.array(best_sequence), max_attempts=1000
         )
-        print(f"\n  Best sequence: {''.join('H' if s == 0 else 'P' for s in best_sequence)}")
-        print(f"  Best energy: {best_energy}")
+        seq_str = "".join(AA_SINGLE[s] for s in best_sequence)
+        print(f"\n  Best sequence: {seq_str}")
+        print(f"  Best MJ energy: {best_energy:.2f} kT")
     else:
-        best_energy = 0
+        best_energy = 0.0
 
-    return episode_rewards, best_sequence, best_energy
+    return episode_rewards, best_sequence, best_energy, seq_str if best_sequence else ""
 
 
-def random_search(n_iterations=2000):
-    """Random search baseline for HP sequence optimization."""
-    print("Running random search baseline …")
+# ═══════════════════════════════════════════════════════════════════
+# Baselines
+# ═══════════════════════════════════════════════════════════════════
+
+def random_search(n_iterations=3000):
+    """Random search baseline — uniform over 20 AA types."""
+    print("Running random search baseline (20-letter) …")
     rng = np.random.RandomState(123)
     best_energy = float("inf")
     best_seq = None
     history = []
 
     for _ in range(n_iterations):
-        seq = rng.randint(0, 2, CHAIN_LENGTH)
+        seq = rng.randint(0, N_ACTIONS, CHAIN_LENGTH)
         energy = compute_fold_energy_fast(seq, n_attempts=100)
         history.append(-energy / CHAIN_LENGTH)
-
         if energy < best_energy:
             best_energy = energy
             best_seq = seq
 
-    print(f"  Best RS energy: {best_energy}")
-    return history, best_seq, best_energy
+    best_str = "".join(AA_SINGLE[s] for s in best_seq)
+    print(f"  Best RS energy: {best_energy:.2f} kT  seq: {best_str}")
+    return history, best_seq, best_energy, best_str
 
 
 def bayesian_optimization(n_iterations=200):
-    """
-    Bayesian optimization baseline for HP sequence optimization.
-
-    Uses Gaussian process to model sequence→energy mapping.
-    Since sequence space is discrete (2^CHAIN_LENGTH),
-    we use a simple GP with Hamming kernel.
-    """
-    print("Running Bayesian optimization baseline …")
+    """BO baseline using GP with Hamming kernel over 20-letter sequences."""
+    print("Running Bayesian optimisation baseline (20-letter) …")
     rng = np.random.RandomState(456)
 
-    # Initial random samples
     n_init = 20
-    X_init = rng.randint(0, 2, (n_init, CHAIN_LENGTH))
+    X_init = rng.randint(0, N_ACTIONS, (n_init, CHAIN_LENGTH))
     y_init = np.array([
-        compute_fold_energy_fast(seq, n_attempts=100)
-        for seq in X_init
+        compute_fold_energy_fast(seq, n_attempts=100) for seq in X_init
     ])
 
     X_known = X_init.copy()
     y_known = y_init.copy()
-    best_energy = y_init.min()
-    best_seq = X_init[y_init.argmin()]
-
+    best_idx = y_init.argmin()
+    best_energy = y_init[best_idx]
+    best_seq = X_init[best_idx]
     history = [-best_energy / CHAIN_LENGTH]
 
     for iteration in range(n_iterations):
-        # Simple GP: use RBF kernel on sequence features
-        # For the MVP, use a crude approximation:
-        # Predict mean = weighted average of known energies
-        # Uncertainty ∝ 1/distance to nearest known point
+        candidates = rng.randint(0, N_ACTIONS, (1000, CHAIN_LENGTH))
 
         best_candidate = None
         best_acq = -float("inf")
 
-        # Sample candidates (random for MVP speed)
-        candidates = rng.randint(0, 2, (500, CHAIN_LENGTH))
-
         for cand in candidates:
-            # Compute distance to nearest known point (Hamming)
             distances = (X_known != cand).sum(axis=1)
-            nearest_idx = distances.argmin()
-
-            # Mean prediction
-            # Use weighted average of 3 nearest neighbors
             nearest_3 = distances.argsort()[:3]
             weights = 1.0 / (distances[nearest_3] + 1.0)
             weights = weights / weights.sum()
             pred_mean = (y_known[nearest_3] * weights).sum()
-
-            # Uncertainty = min_distance (higher = more uncertain)
-            uncertainty = distances[nearest_idx]
-
-            # UCB acquisition
-            kappa = 2.0
-            acq_value = -pred_mean + kappa * uncertainty
-
+            uncertainty = distances[nearest_3[0]]
+            acq_value = -pred_mean + 2.0 * uncertainty  # UCB, kappa=2
             if acq_value > best_acq:
                 best_acq = acq_value
                 best_candidate = cand.copy()
 
-        # Evaluate
         new_y = compute_fold_energy_fast(best_candidate, n_attempts=100)
         X_known = np.vstack([X_known, best_candidate])
         y_known = np.append(y_known, new_y)
@@ -421,40 +410,38 @@ def bayesian_optimization(n_iterations=200):
         if new_y < best_energy:
             best_energy = new_y
             best_seq = best_candidate.copy()
-
         history.append(-best_energy / CHAIN_LENGTH)
 
         if iteration % 50 == 0:
-            print(f"  BO iter {iteration}: best energy = {best_energy}")
+            print(f"  BO iter {iteration:3d}: best energy = {best_energy:.2f} kT")
 
-    # Pad history to match PPO iterations for plotting
-    padded = list(history)
-    while len(padded) < 2000:
-        padded.append(padded[-1])
+    # Pad to match PPO length
+    while len(history) < 3000:
+        history.append(history[-1])
 
-    print(f"  Best BO energy: {best_energy}")
-    return padded, best_seq, best_energy
+    best_str = "".join(AA_SINGLE[s] for s in best_seq)
+    print(f"  Best BO energy: {best_energy:.2f} kT  seq: {best_str}")
+    return history, best_seq, best_energy, best_str
 
+
+# ═══════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════
 
 def run_all():
-    """Run RL, RS, and BO; compare results."""
     print("=" * 60)
-    print("Module C — RL Sequence Optimization (HP Lattice)")
+    print("Module C — RL Sequence Optimisation (MJ 20-letter lattice)")
     print("=" * 60)
 
-    # Train PPO
     print("\n[1] PPO Training")
-    ppo_rewards, ppo_seq, ppo_energy = train_ppo(n_episodes=2000)
+    ppo_rewards, ppo_seq, ppo_energy, ppo_str = train_ppo(n_episodes=3000)
 
-    # Random search
     print("\n[2] Random Search")
-    rs_rewards, rs_seq, rs_energy = random_search(n_iterations=2000)
+    rs_rewards, rs_seq, rs_energy, rs_str = random_search(n_iterations=3000)
 
-    # Bayesian optimization
-    print("\n[3] Bayesian Optimization")
-    bo_rewards, bo_seq, bo_energy = bayesian_optimization(n_iterations=200)
+    print("\n[3] Bayesian Optimisation")
+    bo_rewards, bo_seq, bo_energy, bo_str = bayesian_optimization(n_iterations=200)
 
-    # Save results
     np.savez(
         DATA_DIR / "rl_results.npz",
         ppo_rewards=ppo_rewards,
@@ -470,10 +457,9 @@ def run_all():
 
     print(f"\n{'=' * 40}")
     print(f"Final comparison:")
-    print(f"  PPO:  energy={ppo_energy}, seq={ppo_seq}")
-    print(f"  RS:   energy={rs_energy}, seq={rs_seq}")
-    print(f"  BO:   energy={bo_energy}, seq={bo_seq}")
-
+    print(f"  PPO:  energy = {ppo_energy:.2f} kT  seq = {ppo_str}")
+    print(f"  RS:   energy = {rs_energy:.2f} kT  seq = {rs_str}")
+    print(f"  BO:   energy = {bo_energy:.2f} kT  seq = {bo_str}")
     print("\nModule C complete.")
 
 

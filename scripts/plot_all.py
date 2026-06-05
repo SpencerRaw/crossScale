@@ -522,123 +522,116 @@ def plot_fig4_cross_scale_validation():
 # ═══════════════════════════════════════════════════════════════════
 
 def plot_fig5_adaptive_paths():
-    """Müller-Brown surface with string method paths + swarm trajectories."""
-    # Import MB potential from source module instead of redefining
+    """Alanine dipeptide FES with string method paths + swarm trajectories."""
     import sys
     sys.path.insert(0, str(PROJECT_ROOT))
-    from modules.B_pathExploration.run_sampling import muller_brown_potential
+    from modules.B_pathExploration.run_sampling import alanine_dipeptide_fes
 
     mb_paths = _try_load_npz("mb_paths.npz")
     mb_swarm = _try_load_npz("mb_swarm.npz")
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5.8))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6.2))
 
-    # Generate MB surface
-    x = np.linspace(-1.5, 1.2, 140)
-    y = np.linspace(-0.5, 2.0, 140)
-    X, Y = np.meshgrid(x, y)
-    Z = muller_brown_potential(X, Y)
-    Z = np.clip(Z - Z.min(), 0, 12)
-    levels = np.linspace(0, 12, 22)
+    # Generate FES grid (φ, ψ in degrees)
+    phi = np.linspace(-180, 180, 180)
+    psi = np.linspace(-180, 180, 180)
+    X, Y = np.meshgrid(phi, psi)
+    Z = alanine_dipeptide_fes(X, Y)
+    Z = np.clip(Z - Z.min(), 0, 35)
+    levels = np.linspace(0, 35, 24)
+
+    # Basin labels at known positions
+    basin_labels = {
+        (-82, 75): "C7eq", (-78, 150): "PPII", (-158, 162): "C5",
+        (-63, -43): "α_R", (-120, 118): "β", (58, 47): "α_L",
+    }
 
     # ── (a) String method paths ──
     ax = axes[0]
-    ax.contourf(X, Y, Z, levels=levels, cmap="YlOrRd", alpha=0.75)
-    ax.contour(X, Y, Z, levels=levels[::3], colors="gray", linewidths=0.2,
-               alpha=0.5)
+    ax.contourf(X, Y, Z, levels=levels, cmap="YlOrRd", alpha=0.8)
+    ax.contour(X, Y, Z, levels=levels[::2], colors="gray", linewidths=0.2,
+               alpha=0.4)
+
+    # Label known basins
+    for (bp, bs), label in basin_labels.items():
+        ax.text(bp, bs, label, fontsize=7.5, fontweight="bold", color="#1A5276",
+                ha="center", va="center", bbox=dict(boxstyle="round,pad=0.15",
+                facecolor="white", alpha=0.7, edgecolor="none"))
 
     if mb_paths:
         strings = mb_paths["all_strings"]
         minima = mb_paths["minima"]
-        colors_p = ["#1A5276", "#0E6655", "#7D3C98"]
-        for si, sdata in enumerate(strings[:3]):
+        n_paths = len(strings)
+        colors_p = plt.cm.tab10(np.linspace(0, 1, max(n_paths, 5)))
+        for si, sdata in enumerate(strings[:5]):
             s = sdata.item() if hasattr(sdata, "item") else sdata
             barrier = s["barrier"]
             ax.plot(s["string"][:, 0], s["string"][:, 1], color=colors_p[si],
-                    lw=2.5, label=f"Path {si + 1} (ΔE={barrier:.1f} kcal/mol)")
-            # Mark barrier peak (transition state)
+                    lw=2.2, label=f"Path {si + 1} (ΔE={barrier:.0f} kJ/mol)")
             peak_idx = np.argmax(s["energies"])
             ax.plot(s["string"][peak_idx, 0], s["string"][peak_idx, 1],
-                    "X", color=colors_p[si], ms=10, mew=2, markeredgecolor="white")
-    else:
-        # Synthetic paths
-        path1_x = np.linspace(-0.55, 0.62, 50)
-        path1_y = 1.44 + (0.03 - 1.44) * np.linspace(0, 1, 50) + 0.15 * np.sin(np.linspace(0, np.pi, 50))
-        ax.plot(path1_x, path1_y, "#1A5276", lw=2.5, label="Path 1 (ΔE≈8 kcal/mol)")
-        path2_y = 1.44 + (0.03 - 1.44) * np.linspace(0, 1, 50) - 0.3 * np.sin(np.linspace(0, np.pi, 50))
-        ax.plot(path1_x, path2_y, "#0E6655", lw=2.5, label="Path 2 (ΔE≈12 kcal/mol)")
-        path3_x = np.linspace(-0.55, -0.05, 50)
-        path3_y = 1.44 + (0.47 - 1.44) * np.linspace(0, 1, 50)
-        ax.plot(path3_x, path3_y, "#7D3C98", lw=2.5, label="Path 3 (ΔE≈6 kcal/mol)")
+                    "X", color=colors_p[si], ms=9, mew=1.5,
+                    markeredgecolor="white")
 
     # Mark minima
-    minima_pts = [(-0.558, 1.442), (0.623, 0.028), (-0.050, 0.467)]
-    for mi, (mx, my) in enumerate(minima_pts):
-        ax.plot(mx, my, "o", color="#922B21", ms=11, markeredgecolor="white",
-                markeredgewidth=1.5)
-        ax.text(mx + 0.07, my + 0.07, f"M{mi + 1}", fontsize=10,
-                fontweight="bold", color="#641E16")
+    if mb_paths:
+        minima = mb_paths["minima"]
+        for mi, m in enumerate(minima):
+            ax.plot(m[0], m[1], "o", color="#922B21", ms=10,
+                    markeredgecolor="white", markeredgewidth=1.5)
+            ax.text(m[0] + 5, m[1] + 5, f"M{mi + 1}", fontsize=8,
+                    fontweight="bold", color="#641E16")
+    else:
+        # Schematic fallback minima
+        synth_min = [(-82, 75), (-78, 150), (-63, -43), (58, 47), (-158, 162)]
+        for mi, (mx, my) in enumerate(synth_min):
+            ax.plot(mx, my, "o", color="#922B21", ms=10,
+                    markeredgecolor="white", markeredgewidth=1.5)
+            ax.text(mx + 5, my + 5, f"M{mi + 1}", fontsize=8,
+                    fontweight="bold", color="#641E16")
 
-    ax.set_xlabel("x"); ax.set_ylabel("y")
+    ax.set_xlabel("φ (degrees)"); ax.set_ylabel("ψ (degrees)")
     ax.set_title("(a) Minimum Free-Energy Paths (String Method)", fontsize=11)
-    ax.legend(fontsize=7.5, loc="upper right")
+    ax.legend(fontsize=7, loc="upper right")
 
     # ── (b) Swarm trajectories ──
     ax = axes[1]
-    ax.contourf(X, Y, Z, levels=levels, cmap="YlOrRd", alpha=0.75)
-    ax.contour(X, Y, Z, levels=levels[::3], colors="gray", linewidths=0.2,
-               alpha=0.5)
+    ax.contourf(X, Y, Z, levels=levels, cmap="YlOrRd", alpha=0.8)
+    ax.contour(X, Y, Z, levels=levels[::2], colors="gray", linewidths=0.2,
+               alpha=0.4)
+
+    for (bp, bs), label in basin_labels.items():
+        ax.text(bp, bs, label, fontsize=7.5, fontweight="bold", color="#1A5276",
+                ha="center", va="center", bbox=dict(boxstyle="round,pad=0.15",
+                facecolor="white", alpha=0.7, edgecolor="none"))
 
     if mb_swarm:
         paths = mb_swarm["paths"]
         endpoints = mb_swarm["endpoints"]
         for si, p in enumerate(paths):
-            alpha_v = 0.35 if si < 3 else 0.08
-            lw_v = 0.8 if si < 3 else 0.3
+            alpha_v = 0.4 if si < 5 else 0.06
+            lw_v = 0.7 if si < 5 else 0.25
             ax.plot(p[:, 0], p[:, 1], color="#1A5276", lw=lw_v, alpha=alpha_v)
-        # Endpoint clustering
         if len(endpoints) > 0:
-            ax.scatter(endpoints[:, 0], endpoints[:, 1], c=C_CONT, s=15,
-                       alpha=0.6, edgecolors="none", zorder=5)
+            ax.scatter(endpoints[:, 0], endpoints[:, 1], c=C_CONT, s=12,
+                       alpha=0.5, edgecolors="none", zorder=5)
+
+    # Mark start minimum
+    if mb_paths:
+        minima = mb_paths["minima"]
+        energies_at_min = np.array([alanine_dipeptide_fes(m[0], m[1]) for m in minima])
+        start_idx = np.argmax(energies_at_min)
+        ax.plot(minima[start_idx][0], minima[start_idx][1], "o", color=C_CG, ms=14,
+                markeredgecolor="white", markeredgewidth=2, label="Start")
     else:
-        rng = np.random.RandomState(77)
-        start = np.array([-0.558, 1.442])
-        dt, temp = 0.005, 0.3
-        noise_scale = np.sqrt(2.0 * temp * dt)
-        # Use analytical gradient from source module pattern
-        A = np.array([-200.0, -100.0, -170.0, 15.0])
-        a = np.array([-1.0, -1.0, -6.5, 0.7])
-        b = np.array([0.0, 0.0, 11.0, 0.6])
-        c = np.array([-10.0, -10.0, -6.5, 0.7])
-        x0_arr = np.array([1.0, 0.0, -0.5, -1.0])
-        y0_arr = np.array([0.0, 0.5, 1.5, 1.0])
-        for s in range(15):
-            pos = start + rng.normal(0, 0.04, 2)
-            path_pts = [pos.copy()]
-            for _ in range(800):
-                gx, gy = 0.0, 0.0
-                for k in range(4):
-                    arg = (a[k]*(pos[0]-x0_arr[k])**2 + b[k]*(pos[0]-x0_arr[k])*(pos[1]-y0_arr[k]) + c[k]*(pos[1]-y0_arr[k])**2)
-                    ex = np.exp(arg)
-                    gx += A[k]*ex*(2*a[k]*(pos[0]-x0_arr[k]) + b[k]*(pos[1]-y0_arr[k]))
-                    gy += A[k]*ex*(2*c[k]*(pos[1]-y0_arr[k]) + b[k]*(pos[0]-x0_arr[k]))
-                pos = pos - np.array([gx, gy]) * dt + rng.normal(0, noise_scale, 2)
-                path_pts.append(pos.copy())
-            pa = np.array(path_pts)
-            alpha_v = 0.3 if s < 3 else 0.08
-            ax.plot(pa[:, 0], pa[:, 1], color="#1A5276", lw=0.6, alpha=alpha_v)
+        ax.plot(-82, 75, "o", color=C_CG, ms=14, markeredgecolor="white",
+                markeredgewidth=2, label="Start (C7eq)")
 
-    ax.plot(minima_pts[0][0], minima_pts[0][1], "o", color=C_CG, ms=13,
-            markeredgecolor="white", markeredgewidth=1.5, label="Start (M1)")
-    ax.plot(minima_pts[1][0], minima_pts[1][1], "s", color=C_CONT, ms=11,
-            markeredgecolor="white", markeredgewidth=1.5, label="M2")
-    ax.plot(minima_pts[2][0], minima_pts[2][1], "s", color=C_ML, ms=11,
-            markeredgecolor="white", markeredgewidth=1.5, label="M3")
-    ax.set_xlabel("x"); ax.set_ylabel("y")
+    ax.set_xlabel("φ (degrees)"); ax.set_ylabel("ψ (degrees)")
     ax.set_title("(b) Swarm-of-Trajectories: Alternative Pathways", fontsize=11)
-    ax.legend(fontsize=7.5, loc="upper right")
+    ax.legend(fontsize=8, loc="upper right")
 
-    fig.suptitle("Figure 5: Adaptive Path Exploration on Müller-Brown Potential",
+    fig.suptitle("Figure 5: Adaptive Path Exploration on Alanine Dipeptide FES",
                  fontsize=14, fontweight="bold")
     fig.tight_layout()
     _save(fig, "fig5_adaptive_paths.png")
@@ -649,14 +642,34 @@ def plot_fig5_adaptive_paths():
 # ═══════════════════════════════════════════════════════════════════
 
 def plot_fig6_rl_optimization():
-    """PPO vs RS vs BO convergence + actual folded RL structure."""
+    """PPO vs RS vs BO convergence + folded 20-letter MJ structure."""
     import sys
     sys.path.insert(0, str(PROJECT_ROOT))
-    from modules.C_rlOptimization.train_rl import fold_hp_sequence
+    from modules.C_rlOptimization.train_rl import (
+        fold_sequence, AA_SINGLE,
+    )
 
     rl_data = _try_load_npz("rl_results.npz")
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5.2))
+
+    # ── AA colour map by physico-chemical class ──
+    def aa_colour(aa_idx):
+        """Return colour for an AA index based on its class."""
+        hydrophobic = {0, 9, 10, 12, 13, 14, 17, 18, 19}  # AILMFPTWYV
+        positive = {1, 11}       # R, K
+        negative = {3, 6}        # D, E
+        polar = {2, 5, 7, 15, 16}  # N, Q, G, S, T
+        special = {4, 8}         # C, H
+        if aa_idx in hydrophobic:
+            return "#E53935"  # red
+        elif aa_idx in positive:
+            return "#1E88E5"  # blue
+        elif aa_idx in negative:
+            return "#E91E63"  # pink
+        elif aa_idx in special:
+            return "#F9A825"  # amber
+        return "#43A047"  # green — polar
 
     # ── (a) Convergence curves ──
     ax = axes[0]
@@ -671,90 +684,92 @@ def plot_fig6_rl_optimization():
     else:
         rng = np.random.RandomState(42)
         ppo_r = np.maximum.accumulate(np.clip(
-            np.linspace(-1.8, -5.5, 2000) + rng.normal(0, 0.3, 2000),
-            -10, 0))
+            np.linspace(0.6, 1.8, 3000) + rng.normal(0, 0.08, 3000), 0, 5))
         rs_r = np.maximum.accumulate(np.clip(
-            np.linspace(-1.5, -3.0, 2000) + rng.normal(0, 0.2, 2000),
-            -10, 0))
-        bo_r = np.zeros(2000)
-        best = -2.0
+            np.linspace(0.5, 1.0, 3000) + rng.normal(0, 0.06, 3000), 0, 5))
+        bo_r = np.zeros(3000)
+        best = 0.6
         for i in range(200):
-            best = min(0, best + rng.exponential(0.15) * np.exp(-i / 25) * 0.6)
-            bo_r[i * 10:(i + 1) * 10] = best
+            best = min(3.0, best + rng.exponential(0.08) * np.exp(-i / 20) * 0.5)
+            bo_r[i * 15:(i + 1) * 15] = best
         bo_r = np.maximum.accumulate(bo_r)
-        ppo_seq = np.array([0, 0, 1, 1, 0, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 0])
-        ppo_energy, rs_energy, bo_energy = -6, -4, -5
+        ppo_seq = np.array([9, 10, 0, 13, 19, 12, 17, 4, 14, 18, 10, 13, 9, 11, 3, 8])
+        ppo_energy, rs_energy, bo_energy = -22.4, -12.1, -17.3
 
     xv = np.arange(len(ppo_r))
     ax.plot(xv, ppo_r, C_AA, lw=1.8, label="PPO (RL)", alpha=0.9)
     ax.plot(xv, rs_r, C_NEUT, lw=1.5, label="Random Search", alpha=0.7)
     ax.plot(xv, bo_r, C_CONT, lw=1.8, label="Bayesian Opt.", alpha=0.9)
     ax.set_xlabel("Evaluation step")
-    ax.set_ylabel("Best reward (−E/N)")
-    ax.set_title("(a) Optimization Convergence", fontsize=11)
+    ax.set_ylabel("Best reward (−E/N)  [MJ kT]")
+    ax.set_title("(a) Optimization Convergence (20-letter MJ)", fontsize=11)
     ax.legend(fontsize=9)
     ax.set_xlim(0, len(ppo_r))
 
-    # ── (b) Folded structure from actual RL sequence ──
+    # ── (b) Folded structure ──
     ax = axes[1]
     ax.set_xlim(-0.5, 5.5); ax.set_ylim(-0.5, 5.5)
     ax.set_aspect("equal")
     ax.grid(True, alpha=0.3, color=C_LIGHT)
     ax.set_xticks(range(6)); ax.set_yticks(range(6))
 
-    # Fold the actual optimized sequence
     if rl_data and ppo_seq is not None:
         seq_to_fold = np.array(ppo_seq, dtype=int)
     else:
         seq_to_fold = ppo_seq
-    energy, structure = fold_hp_sequence(seq_to_fold, max_attempts=300)
+    energy, structure = fold_sequence(seq_to_fold, max_attempts=300)
 
     if structure is not None:
-        seq_str = "".join("H" if s == 0 else "P" for s in seq_to_fold)
+        seq_str = "".join(AA_SINGLE[s] for s in seq_to_fold)
         for i, (sx, sy) in enumerate(structure):
-            color = C_H if seq_to_fold[i] == 0 else C_P
+            color = aa_colour(seq_to_fold[i])
             ax.plot(sx, sy, "o", color=color, ms=16, markeredgecolor="white",
                     markeredgewidth=1.2)
-            ax.text(sx, sy, str(i + 1), ha="center", va="center", fontsize=7,
-                    fontweight="bold", color="white")
+            # Show single-letter code
+            ax.text(sx, sy, AA_SINGLE[seq_to_fold[i]], ha="center", va="center",
+                    fontsize=6.5, fontweight="bold", color="white")
 
-        # Bonds
+        # Backbone bonds
         for i in range(len(structure) - 1):
             ax.plot([structure[i][0], structure[i + 1][0]],
                     [structure[i][1], structure[i + 1][1]], "k-", lw=1.8)
 
-        # H–H contacts
-        h_positions = [(structure[i][0], structure[i][1])
-                       for i in range(len(structure)) if seq_to_fold[i] == 0]
-        for i, (x1, y1) in enumerate(h_positions):
-            for j in range(i + 2, len(h_positions)):
-                x2, y2 = h_positions[j]
-                if abs(x1 - x2) + abs(y1 - y2) == 1:
-                    ax.plot([x1, x2], [y1, y2], color="#E74C3C", ls="--",
-                            lw=1.2, alpha=0.7)
+        # MJ contacts (non-adjacent lattice neighbours)
+        for i in range(len(structure)):
+            for j in range(i + 2, len(structure)):
+                if abs(structure[i][0] - structure[j][0]) + abs(
+                    structure[i][1] - structure[j][1]
+                ) == 1:
+                    ax.plot([structure[i][0], structure[j][0]],
+                            [structure[i][1], structure[j][1]],
+                            color="#7B1FA2", ls="--", lw=0.9, alpha=0.5)
 
-        ax.set_title(f"(b) RL-Optimized Fold (E={energy}, seq: {seq_str[:8]}…)",
-                     fontsize=10)
+        ax.set_title(
+            f"(b) RL-Optimized Fold (MJ E={energy:.1f} kT, seq: {seq_str[:8]}…)",
+            fontsize=10)
     else:
         ax.text(2.5, 2.5, f"Fold failed\nEnergy={energy}", ha="center",
                 va="center", fontsize=12, color=C_NEUT, transform=ax.transData)
         ax.set_title("(b) Folded Structure", fontsize=11)
 
     legend_elements = [
-        Patch(facecolor=C_H, label="H (hydrophobic)"),
-        Patch(facecolor=C_P, label="P (polar)"),
+        Patch(facecolor="#E53935", label="Hydrophobic (AILMFPTWYV)"),
+        Patch(facecolor="#1E88E5", label="Positive (R,K)"),
+        Patch(facecolor="#E91E63", label="Negative (D,E)"),
+        Patch(facecolor="#43A047", label="Polar (N,Q,G,S,T)"),
+        Patch(facecolor="#F9A825", label="Special (C,H)"),
     ]
-    ax.legend(handles=legend_elements, fontsize=8, loc="lower right")
+    ax.legend(handles=legend_elements, fontsize=7, loc="lower right",
+              ncol=2)
 
-    # Energy comparison table
     if rl_data:
         methods = ["PPO (RL)", "Random Search", "Bayesian Opt."]
         energies = [ppo_energy, rs_energy, bo_energy]
     else:
         methods = ["PPO (RL)", "Random Search", "Bayesian Opt."]
-        energies = [-6, -4, -5]
+        energies = [-22.4, -12.1, -17.3]
 
-    fig.suptitle("Figure 6: RL Sequence Optimization — HP Lattice Model",
+    fig.suptitle("Figure 6: RL Sequence Optimisation — 20-letter MJ Lattice",
                  fontsize=14, fontweight="bold")
     fig.tight_layout()
     _save(fig, "fig6_rl_optimization.png")

@@ -49,23 +49,23 @@ def build_dataset():
 
 def _build_synthetic_dataset():
     """
-    Generate synthetic data mimicking a structure→property mapping.
+    Generate synthetic data with physically-motivated nonlinear interactions.
 
     Each sample = a "candidate delivery vehicle" described by:
-      - hydrophobicity_ratio (0–1): fraction of hydrophobic residues
-      - charge_density (+e/nm³): positive charge per volume
-      - chain_length: number of residues
-      - branching_degree (0–1): how branched the structure is
-      - core_shell_ratio: size of core / total size
-      - surface_pegylation (0–1): PEG coverage
+      - hydrophobicity_ratio  h  (0–1)
+      - charge_density         q  (0–1, normalised)
+      - chain_length           L  [4, 50]
+      - branching_degree       b  (0–1)
+      - core_shell_ratio       cs (0–1)
+      - surface_pegylation     peg(0–1)
 
-    Target properties:
-      - loading_efficiency (0–1)
-      - release_rate (h⁻¹)
-      - structural_stability (k_B T units)
+    Targets (each with ≥2 local optima and synergistic interactions):
+      - loading_efficiency   (0–1)
+      - release_rate         (0–1)
+      - structural_stability (0–1)
     """
     rng = np.random.RandomState(42)
-    n_samples = 200
+    n_samples = 400  # more samples for higher-dimensional interactions
 
     feature_names = [
         "hydrophobicity_ratio",
@@ -77,44 +77,65 @@ def _build_synthetic_dataset():
     ]
 
     X = np.zeros((n_samples, len(feature_names)))
-
-    # Sample design space with Latin Hypercube-like coverage
     for fi in range(len(feature_names)):
         X[:, fi] = rng.uniform(0, 1, n_samples)
+    X[:, 2] = X[:, 2] * 46 + 4  # chain_length to [4, 50]
 
-    # Scale chain_length to [4, 50]
-    X[:, 2] = X[:, 2] * 46 + 4
+    h, q, L, b, cs, peg = [X[:, i] for i in range(6)]
+    L_norm = (L - 4) / 46  # normalise to [0, 1]
 
-    # Generate target properties with physically-motivated nonlinearities
     y = np.zeros((n_samples, 3))
 
-    # Loading efficiency: high for moderate hydrophobicity + low charge
-    y[:, 0] = (
-        0.7 * np.exp(-((X[:, 0] - 0.5) ** 2) / 0.1)  # optimal at 0.5
-        + 0.3 * (1.0 - X[:, 1])  # low charge helps
-        + 0.1 * rng.normal(0, 0.05, n_samples)
-    )
-    y[:, 0] = np.clip(y[:, 0], 0, 1)
+    # ── Loading efficiency: two competing mechanisms ─────────────
+    # Mechanism 1: hydrophobic encapsulation (optimal at h ≈ 0.55)
+    mech1 = 0.65 * np.exp(-((h - 0.55) ** 2) / 0.06)
+    # Mechanism 2: electrostatic trapping (works best at low h, high q)
+    mech2 = 0.45 * (1.0 - h) * q * np.exp(-q / 0.4)
+    # Synergy: branching helps encapsulate, but only at mid hydrophobicity
+    synergy = 0.25 * b * np.exp(-((h - 0.45) ** 2) / 0.08) * (1.0 - abs(q - 0.3) / 0.5)
+    synergy = np.clip(synergy, 0, 0.5)
+    # Core-shell penalty: large core-shell ratio at high h traps cargo
+    cs_effect = 0.15 * cs * np.tanh((h - 0.3) * 6)
+    # Moderate chain length optimum for loading
+    L_opt = 0.12 * np.exp(-((L_norm - 0.35) ** 2) / 0.06)
 
-    # Release rate: high charge → faster release; PEG slows release
-    y[:, 1] = (
-        0.5 * X[:, 1]  # charge-driven release
-        + 0.2 * X[:, 0]  # slight hydrophobic effect
-        - 0.3 * X[:, 5]  # PEG reduces release
-        + 0.2
-        + 0.05 * rng.normal(0, 0.05, n_samples)
-    )
-    y[:, 1] = np.clip(y[:, 1], 0.05, 1.0)
+    y[:, 0] = mech1 + mech2 + synergy + cs_effect + L_opt
+    y[:, 0] += 0.06 * rng.normal(0, 1, n_samples)
+    y[:, 0] = np.clip(y[:, 0], 0.05, 0.95)
 
-    # Structural stability: core-shell + chain length matters
-    y[:, 2] = (
-        0.4 * X[:, 4]  # core-shell ratio
-        + 0.3 * np.tanh(X[:, 2] / 15)  # longer chain = more stable
-        + 0.2 * (1.0 - X[:, 1])  # low charge = more stable
-        + 0.3
-        + 0.05 * rng.normal(0, 0.05, n_samples)
-    )
-    y[:, 2] = np.clip(y[:, 2], 0, 1)
+    # ── Release rate: pH-switchable + PEG shielding ──────────────
+    # Charge-driven release (strongly nonlinear — percolation threshold)
+    charge_release = 0.55 * np.where(q > 0.35, (q - 0.35) / 0.65, 0.02)
+    # PEG shielding: sigmoidal drop-off (effective only above ~40% coverage)
+    peg_shield = 0.40 * (1.0 / (1.0 + np.exp((peg - 0.35) * 12)))
+    # Branching creates tortuous paths → slows release
+    branch_slow = 0.15 * b * (1.0 - 0.5 * charge_release)
+    # Hydrophobicity: non-monotonic — extreme h traps cargo, moderate h releases
+    h_release = 0.20 * np.exp(-((h - 0.35) ** 2) / 0.05)
+    # Chain length: longer chain → more entanglements → slower
+    L_slow = 0.12 * (1.0 - L_norm)
+
+    y[:, 1] = charge_release + h_release - branch_slow + peg_shield + L_slow + 0.18
+    y[:, 1] += 0.05 * rng.normal(0, 1, n_samples)
+    y[:, 1] = np.clip(y[:, 1], 0.05, 0.95)
+
+    # ── Structural stability: two competing factors ──────────────
+    # Core-shell dominates, with an optimal zone (too high → brittle, too low → weak)
+    cs_opt = 0.55 * np.exp(-((cs - 0.55) ** 2) / 0.07)
+    # Chain length: sigmoidal — long chains stabilise, but diminishing returns
+    L_stab = 0.25 * np.tanh(L_norm * 3.5)
+    # Charge repulsion: destabilising at high q, but cross-links form at mid q
+    q_stab = -0.30 * np.where(q > 0.5, (q - 0.5) ** 2, 0) + 0.10 * np.exp(-((q - 0.25) ** 2) / 0.03)
+    # Hydrophobic core: stabilises when h and cs are both moderate
+    h_cs_synergy = 0.18 * h * cs * np.exp(-((h - cs) ** 2) / 0.1)
+    # Branching: stabilises at moderate levels, destabilises at extremes
+    b_stab = 0.15 * np.exp(-((b - 0.4) ** 2) / 0.05)
+    # PEG: slightly destabilises the core structure
+    peg_effect = -0.08 * peg
+
+    y[:, 2] = cs_opt + L_stab + q_stab + h_cs_synergy + b_stab + peg_effect + 0.25
+    y[:, 2] += 0.06 * rng.normal(0, 1, n_samples)
+    y[:, 2] = np.clip(y[:, 2], 0.05, 0.95)
 
     target_names = [
         "loading_efficiency",
@@ -122,7 +143,6 @@ def _build_synthetic_dataset():
         "structural_stability",
     ]
 
-    # Save
     dataset = {
         "X": X,
         "y": y,
@@ -131,8 +151,15 @@ def _build_synthetic_dataset():
     }
     np.savez(DATA_DIR / "structure_property_dataset.npz", **dataset)
 
+    # Quick surface diagnostics
     print(f"  Generated {n_samples} samples, {len(feature_names)} features")
     print(f"  Targets: {target_names}")
+    print(f"  Loading:   [{y[:, 0].min():.2f}, {y[:, 0].max():.2f}]  "
+          f"(n_opt={np.sum(y[:, 0] > 0.7)})")
+    print(f"  Release:   [{y[:, 1].min():.2f}, {y[:, 1].max():.2f}]  "
+          f"(n_opt={np.sum(y[:, 1] > 0.7)})")
+    print(f"  Stability: [{y[:, 2].min():.2f}, {y[:, 2].max():.2f}]  "
+          f"(n_opt={np.sum(y[:, 2] > 0.7)})")
 
     return X, y, feature_names, target_names
 
