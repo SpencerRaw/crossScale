@@ -144,14 +144,17 @@ def composition_penalty(sequence):
     aa_bias = max(0.0, max_frac - 0.30) * 2.0
 
     # Class coverage: penalise missing major classes
-    hydrophobic = np.isin(seq, [0, 9, 10, 12, 13, 14, 17, 18, 19])
+    hydrophobic = np.isin(seq, [0, 4, 9, 10, 12, 13, 14, 17, 18, 19])  # A,C,I,L,M,F,P,W,Y,V
+    positive    = np.isin(seq, [1, 8, 11])            # R, H, K
+    negative    = np.isin(seq, [3, 6])                # D, E
+    polar       = np.isin(seq, [2, 5, 7, 15, 16])     # N, Q, G, S, T
     classes_present = sum([
         hydrophobic.any(),
-        np.isin(seq, [1, 11]).any(),           # positive
-        np.isin(seq, [3, 6]).any(),            # negative
-        np.isin(seq, [2, 5, 7, 15, 16]).any(), # polar
+        positive.any(),
+        negative.any(),
+        polar.any(),
     ])
-    class_bonus = -0.25 * max(0, 3 - classes_present)
+    class_bonus = 0.15 * max(0, 3 - classes_present)
 
     return aa_bias + class_bonus
 
@@ -189,13 +192,13 @@ class SequenceEnvironment:
             return np.array([0.0] * 7, dtype=np.float32)
 
         seq = np.array(self.sequence)
-        # Physico-chemical classes
-        hydrophobic = np.isin(seq, [0, 9, 10, 12, 13, 14, 17, 18, 19]).mean()  # AILMFPTWYV
-        positive    = np.isin(seq, [1, 11]).mean()   # R, K
-        negative    = np.isin(seq, [3, 6]).mean()    # D, E
+        # Physico-chemical classes (matching composition_penalty)
+        hydrophobic = np.isin(seq, [0, 4, 9, 10, 12, 13, 14, 17, 18, 19]).mean()  # A,C,I,L,M,F,P,W,Y,V
+        positive    = np.isin(seq, [1, 8, 11]).mean()   # R, H, K
+        negative    = np.isin(seq, [3, 6]).mean()       # D, E
         polar       = np.isin(seq, [2, 5, 7, 15, 16]).mean()  # N, Q, G, S, T
-        aromatic    = np.isin(seq, [13, 17, 18]).mean()  # F, W, Y
-        special     = np.isin(seq, [4, 8]).mean()    # C, H
+        aromatic    = np.isin(seq, [13, 17, 18]).mean()  # F, W, Y (subset of hydrophobic)
+        special     = np.isin(seq, [4, 8]).mean()       # C, H (now also in hydrophobic/positive)
         len_frac    = L / self.chain_length
 
         return np.array([
