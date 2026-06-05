@@ -380,8 +380,8 @@ def _run_bo_botorch(X, y, models, feature_names):
         torch.tensor(X.max(0)),
     ])
 
-    X_t = torch.tensor(X[:20], dtype=torch.float32)
-    y_t = torch.tensor(y_obj[:20], dtype=torch.float32).reshape(-1, 1)
+    X_t = torch.tensor(X[:20], dtype=torch.float64)
+    y_t = torch.tensor(y_obj[:20], dtype=torch.float64).reshape(-1, 1)
 
     best_y = y_t.max().item()
     history = [best_y]
@@ -401,7 +401,7 @@ def _run_bo_botorch(X, y, models, feature_names):
         new_y = pred_loading * pred_stability
 
         X_t = torch.cat([X_t, candidate])
-        y_t = torch.cat([y_t, torch.tensor([[new_y]], dtype=torch.float32)])
+        y_t = torch.cat([y_t, torch.tensor([[new_y]], dtype=torch.float64)])
 
         if new_y > best_y:
             best_y = new_y
