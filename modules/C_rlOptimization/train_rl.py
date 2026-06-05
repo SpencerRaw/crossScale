@@ -128,6 +128,34 @@ def compute_fold_energy_fast(sequence, n_attempts=200):
     return energy
 
 
+def composition_penalty(sequence):
+    """
+    Penalise extreme composition bias to prevent trivial solutions
+    (e.g. all-K/R sequences exploiting the MJ matrix).
+
+    Two components:
+      1. Any single AA > 30% → linear penalty
+      2. Bonus for covering diverse physico-chemical classes
+    """
+    seq = np.asarray(sequence, dtype=int)
+    n = len(seq)
+    bc = np.bincount(seq, minlength=20)
+    max_frac = bc.max() / n
+    aa_bias = max(0.0, max_frac - 0.30) * 8.0
+
+    # Class coverage: penalise missing major classes
+    hydrophobic = np.isin(seq, [0, 9, 10, 12, 13, 14, 17, 18, 19])
+    classes_present = sum([
+        hydrophobic.any(),
+        np.isin(seq, [1, 11]).any(),           # positive
+        np.isin(seq, [3, 6]).any(),            # negative
+        np.isin(seq, [2, 5, 7, 15, 16]).any(), # polar
+    ])
+    class_bonus = -0.25 * max(0, 3 - classes_present)
+
+    return aa_bias + class_bonus
+
+
 # ═══════════════════════════════════════════════════════════════════
 # RL Environment
 # ═══════════════════════════════════════════════════════════════════
@@ -178,11 +206,12 @@ class SequenceEnvironment:
         self.sequence.append(int(action))
         if len(self.sequence) == self.chain_length:
             self.done = True
-            energy = compute_fold_energy_fast(
-                np.array(self.sequence), n_attempts=100
-            )
-            # Scale: typical best MJ energy ≈ −10 to −25 for length 16
-            reward = float(-energy) / self.chain_length
+            seq_arr = np.array(self.sequence)
+            energy = compute_fold_energy_fast(seq_arr, n_attempts=150)
+            comp_pen = composition_penalty(seq_arr)
+            # Higher energy (more negative MJ) = better folding
+            # Lower composition penalty = more diverse
+            reward = float(-energy) / self.chain_length - comp_pen
         else:
             reward = 0.0
         return self._get_state(), reward, self.done
@@ -193,8 +222,10 @@ class SequenceEnvironment:
 # ═══════════════════════════════════════════════════════════════════
 
 class SimplePPO:
-    def __init__(self, state_dim=7, n_actions=N_ACTIONS, lr=0.005):
+    def __init__(self, state_dim=7, n_actions=N_ACTIONS, lr=0.005,
+                 ent_coef=0.02):
         self.n_actions = n_actions
+        self.ent_coef = ent_coef
         rng = np.random.RandomState(42)
 
         scale1 = np.sqrt(2.0 / state_dim)
@@ -208,6 +239,7 @@ class SimplePPO:
         self.b_v = np.zeros(1)
 
         self.lr = lr
+        self.steps_trained = 0
 
     @staticmethod
     def _relu(x):
@@ -234,6 +266,8 @@ class SimplePPO:
 
     def update(self, states, actions, old_log_probs, returns, advantages):
         batch_size = len(states)
+        clip_eps = 0.2
+
         for i in range(batch_size):
             s, a, old_lp, ret, adv = (
                 states[i], actions[i], old_log_probs[i],
@@ -241,12 +275,19 @@ class SimplePPO:
             )
             probs, value, (h1, h2) = self.forward(s)
             new_lp = np.log(probs[a] + 1e-10)
-            ratio = np.exp(new_lp - old_lp)
+            ratio = np.exp(np.clip(new_lp - old_lp, -10, 10))
 
-            # Policy gradient
+            # PPO clipped policy gradient
+            clipped_ratio = np.clip(ratio, 1 - clip_eps, 1 + clip_eps)
+            policy_gain = min(ratio * adv, clipped_ratio * adv)
+
             grad_logits = probs.copy()
             grad_logits[a] -= 1.0
-            grad_logits *= adv * ratio
+            grad_logits *= policy_gain
+
+            # Entropy bonus: -grad(H) encourages exploration
+            ent = -(probs * np.log(probs + 1e-10)).sum()
+            grad_logits += self.ent_coef * probs * (np.log(probs + 1e-10) + 1)
 
             self.W_pi -= self.lr * np.outer(h2, grad_logits)
             self.b_pi -= self.lr * grad_logits
@@ -257,7 +298,7 @@ class SimplePPO:
             self.b_v -= self.lr * v_err
 
             # Shared layers
-            grad_h2 = (self.W_pi @ grad_logits + self.W_v.flatten() * v_err)
+            grad_h2 = self.W_pi @ grad_logits + self.W_v.flatten() * v_err
             grad_h2[h2 <= 0] = 0
             self.W2 -= self.lr * np.outer(h1, grad_h2)
             self.b2 -= self.lr * grad_h2
@@ -267,12 +308,17 @@ class SimplePPO:
             self.W1 -= self.lr * np.outer(s, grad_h1)
             self.b1 -= self.lr * grad_h1
 
+        self.steps_trained += batch_size
+        # Decay entropy coefficient over time
+        if self.steps_trained % 5000 == 0:
+            self.ent_coef = max(0.002, self.ent_coef * 0.85)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Training
 # ═══════════════════════════════════════════════════════════════════
 
-def train_ppo(n_episodes=3000):
+def train_ppo(n_episodes=5000):
     """Train PPO agent on 20-letter MJ sequence optimisation."""
     print("Training PPO agent (20-letter MJ, 16-residue chain) …")
     env = SequenceEnvironment(CHAIN_LENGTH)
@@ -281,6 +327,7 @@ def train_ppo(n_episodes=3000):
     episode_rewards = []
     best_reward = -float("inf")
     best_sequence = None
+    best_raw_mj = float("inf")
     gamma = 0.95
 
     for episode in range(n_episodes):
@@ -323,19 +370,25 @@ def train_ppo(n_episodes=3000):
         if total_reward > best_reward:
             best_reward = total_reward
             best_sequence = env.sequence.copy()
+            seq_arr = np.array(best_sequence)
+            raw_e = compute_fold_energy_fast(seq_arr, n_attempts=200)
+            best_raw_mj = raw_e
 
-        if episode % 500 == 0:
-            avg_r = np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards)
+        if episode % 1000 == 0:
+            avg_r = np.mean(episode_rewards[-200:]) if len(episode_rewards) >= 200 else np.mean(episode_rewards)
             print(f"  Episode {episode:4d}: avg_reward = {avg_r:.3f}, "
-                  f"best = {best_reward:.3f}")
+                  f"best = {best_reward:.3f}, ent_coef = {agent.ent_coef:.4f}")
 
     if best_sequence is not None:
         best_energy, best_structure = fold_sequence(
             np.array(best_sequence), max_attempts=1000
         )
         seq_str = "".join(AA_SINGLE[s] for s in best_sequence)
+        comp = composition_penalty(np.array(best_sequence))
         print(f"\n  Best sequence: {seq_str}")
-        print(f"  Best MJ energy: {best_energy:.2f} kT")
+        print(f"  Raw MJ energy:     {best_energy:.2f} kT")
+        print(f"  Composition penalty: {comp:.3f}")
+        print(f"  Constrained reward:  {best_reward:.3f} ( = {-best_energy/CHAIN_LENGTH:.1f} - {comp:.3f})")
     else:
         best_energy = 0.0
 
@@ -346,10 +399,11 @@ def train_ppo(n_episodes=3000):
 # Baselines
 # ═══════════════════════════════════════════════════════════════════
 
-def random_search(n_iterations=3000):
-    """Random search baseline — uniform over 20 AA types."""
-    print("Running random search baseline (20-letter) …")
+def random_search(n_iterations=5000):
+    """Random search baseline with composition penalty for fair comparison."""
+    print("Running random search baseline (20-letter, constrained) …")
     rng = np.random.RandomState(123)
+    best_constrained = -float("inf")
     best_energy = float("inf")
     best_seq = None
     history = []
@@ -357,36 +411,43 @@ def random_search(n_iterations=3000):
     for _ in range(n_iterations):
         seq = rng.randint(0, N_ACTIONS, CHAIN_LENGTH)
         energy = compute_fold_energy_fast(seq, n_attempts=100)
-        history.append(-energy / CHAIN_LENGTH)
-        if energy < best_energy:
+        comp = composition_penalty(seq)
+        constrained = -energy / CHAIN_LENGTH - comp
+        history.append(constrained)
+        if constrained > best_constrained:
+            best_constrained = constrained
             best_energy = energy
             best_seq = seq
 
+    comp_best = composition_penalty(best_seq)
     best_str = "".join(AA_SINGLE[s] for s in best_seq)
-    print(f"  Best RS energy: {best_energy:.2f} kT  seq: {best_str}")
+    print(f"  Best RS: raw_MJ = {best_energy:.2f} kT, constrained = {best_constrained:.3f}, "
+          f"seq: {best_str}")
     return history, best_seq, best_energy, best_str
 
 
-def bayesian_optimization(n_iterations=200):
-    """BO baseline using GP with Hamming kernel over 20-letter sequences."""
-    print("Running Bayesian optimisation baseline (20-letter) …")
+def bayesian_optimization(n_iterations=300):
+    """BO baseline using GP with Hamming kernel + composition penalty."""
+    print("Running Bayesian optimisation baseline (20-letter, constrained) …")
     rng = np.random.RandomState(456)
 
     n_init = 20
     X_init = rng.randint(0, N_ACTIONS, (n_init, CHAIN_LENGTH))
     y_init = np.array([
-        compute_fold_energy_fast(seq, n_attempts=100) for seq in X_init
+        -compute_fold_energy_fast(seq, n_attempts=100) / CHAIN_LENGTH
+        - composition_penalty(seq)
+        for seq in X_init
     ])
 
     X_known = X_init.copy()
     y_known = y_init.copy()
-    best_idx = y_init.argmin()
-    best_energy = y_init[best_idx]
+    best_idx = y_init.argmax()
+    best_constrained = y_init[best_idx]
     best_seq = X_init[best_idx]
-    history = [-best_energy / CHAIN_LENGTH]
+    history = [best_constrained]
 
     for iteration in range(n_iterations):
-        candidates = rng.randint(0, N_ACTIONS, (1000, CHAIN_LENGTH))
+        candidates = rng.randint(0, N_ACTIONS, (2000, CHAIN_LENGTH))
 
         best_candidate = None
         best_acq = -float("inf")
@@ -398,29 +459,33 @@ def bayesian_optimization(n_iterations=200):
             weights = weights / weights.sum()
             pred_mean = (y_known[nearest_3] * weights).sum()
             uncertainty = distances[nearest_3[0]]
-            acq_value = -pred_mean + 2.0 * uncertainty  # UCB, kappa=2
+            acq_value = pred_mean + 1.5 * uncertainty  # UCB
             if acq_value > best_acq:
                 best_acq = acq_value
                 best_candidate = cand.copy()
 
-        new_y = compute_fold_energy_fast(best_candidate, n_attempts=100)
+        new_e = compute_fold_energy_fast(best_candidate, n_attempts=100)
+        new_constrained = -new_e / CHAIN_LENGTH - composition_penalty(best_candidate)
         X_known = np.vstack([X_known, best_candidate])
-        y_known = np.append(y_known, new_y)
+        y_known = np.append(y_known, new_constrained)
 
-        if new_y < best_energy:
-            best_energy = new_y
+        if new_constrained > best_constrained:
+            best_constrained = new_constrained
             best_seq = best_candidate.copy()
-        history.append(-best_energy / CHAIN_LENGTH)
+        history.append(best_constrained)
 
-        if iteration % 50 == 0:
-            print(f"  BO iter {iteration:3d}: best energy = {best_energy:.2f} kT")
+        if iteration % 75 == 0:
+            print(f"  BO iter {iteration:3d}: best constrained = {best_constrained:.3f}")
 
     # Pad to match PPO length
-    while len(history) < 3000:
+    while len(history) < 5000:
         history.append(history[-1])
 
+    best_energy = compute_fold_energy_fast(best_seq, n_attempts=200)
+    comp_best = composition_penalty(best_seq)
     best_str = "".join(AA_SINGLE[s] for s in best_seq)
-    print(f"  Best BO energy: {best_energy:.2f} kT  seq: {best_str}")
+    print(f"  Best BO: raw_MJ = {best_energy:.2f} kT, constrained = {best_constrained:.3f}, "
+          f"seq: {best_str}")
     return history, best_seq, best_energy, best_str
 
 
@@ -434,13 +499,13 @@ def run_all():
     print("=" * 60)
 
     print("\n[1] PPO Training")
-    ppo_rewards, ppo_seq, ppo_energy, ppo_str = train_ppo(n_episodes=3000)
+    ppo_rewards, ppo_seq, ppo_energy, ppo_str = train_ppo(n_episodes=5000)
 
     print("\n[2] Random Search")
-    rs_rewards, rs_seq, rs_energy, rs_str = random_search(n_iterations=3000)
+    rs_rewards, rs_seq, rs_energy, rs_str = random_search(n_iterations=5000)
 
     print("\n[3] Bayesian Optimisation")
-    bo_rewards, bo_seq, bo_energy, bo_str = bayesian_optimization(n_iterations=200)
+    bo_rewards, bo_seq, bo_energy, bo_str = bayesian_optimization(n_iterations=300)
 
     np.savez(
         DATA_DIR / "rl_results.npz",
@@ -455,11 +520,21 @@ def run_all():
         bo_energy=bo_energy,
     )
 
+    # Report both raw MJ energy and constrained reward for fair comparison
     print(f"\n{'=' * 40}")
-    print(f"Final comparison:")
-    print(f"  PPO:  energy = {ppo_energy:.2f} kT  seq = {ppo_str}")
-    print(f"  RS:   energy = {rs_energy:.2f} kT  seq = {rs_str}")
-    print(f"  BO:   energy = {bo_energy:.2f} kT  seq = {bo_str}")
+    print(f"Final comparison (constrained reward = -E/N - composition_penalty):")
+    print(f"  PPO:  raw_MJ = {ppo_energy:.2f} kT,  seq = {ppo_str}")
+    print(f"  RS:   raw_MJ = {rs_energy:.2f} kT,  seq = {rs_str}")
+    print(f"  BO:   raw_MJ = {bo_energy:.2f} kT,  seq = {bo_str}")
+    if ppo_seq is not None:
+        ppo_comp = composition_penalty(np.array(ppo_seq))
+        print(f"  PPO constrained reward = {-ppo_energy/CHAIN_LENGTH:.3f} - {ppo_comp:.3f} = {-ppo_energy/CHAIN_LENGTH - ppo_comp:.3f}")
+    if rs_seq is not None:
+        rs_comp = composition_penalty(np.array(rs_seq))
+        print(f"  RS  constrained reward = {-rs_energy/CHAIN_LENGTH:.3f} - {rs_comp:.3f} = {-rs_energy/CHAIN_LENGTH - rs_comp:.3f}")
+    if bo_seq is not None:
+        bo_comp = composition_penalty(np.array(bo_seq))
+        print(f"  BO  constrained reward = {-bo_energy/CHAIN_LENGTH:.3f} - {bo_comp:.3f} = {-bo_energy/CHAIN_LENGTH - bo_comp:.3f}")
     print("\nModule C complete.")
 
 

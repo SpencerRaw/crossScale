@@ -2,18 +2,14 @@
 Adaptive path exploration on the alanine dipeptide free energy surface.
 
 φ/ψ Ramachandran map with 5+ minima, multiple saddle points, and
-biologically-relevant barriers (2–25 kJ/mol). This replaces the
-Müller-Brown toy potential with a realistic biomolecular landscape.
+biologically-relevant barriers (2–35 kJ/mol).
 
-This module:
-  1. Samples the FES with Metropolis Monte Carlo
-  2. Finds multiple minima via multi-start gradient descent
-  3. String method for minimum free-energy paths between minima
-  4. Swarm-of-trajectories to discover alternative pathways
+The FES is built as a sum of periodic Gaussians anchored at
+literature-verified stationary points from Amber ff14SB / implicit
+solvent.  C7eq (φ≈−82°, ψ≈75°) is the global minimum.
 
 Usage:
     python -m modules.B_pathExploration.run_sampling
-
 Output:
     data/mb_samples.npz, mb_minima.npy, mb_paths.npz, mb_swarm.npz
 """
@@ -26,96 +22,88 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = PROJECT_ROOT / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# ── Periodic distance helper ──────────────────────────────────────
-def _pdist(a, b, period=360.0):
-    """Shortest signed distance on a circle with given period."""
-    d = (np.asarray(a) - np.asarray(b)) % period
-    d = np.where(d > period / 2, d - period, d)
-    return d
+# ── Periodic helper ───────────────────────────────────────────────
+def _pwrap(d, period=360.0):
+    """Wrap angular difference to [−period/2, period/2]."""
+    return (np.asarray(d) + period / 2.0) % period - period / 2.0
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Alanine dipeptide free energy surface
+# Alanine dipeptide FES — sum of periodic Gaussians
 # ═══════════════════════════════════════════════════════════════════
 
 def alanine_dipeptide_fes(phi, psi):
     """
     Alanine dipeptide φ/ψ free energy surface (kJ/mol).
 
-    φ (phi)   = C–N–Cα–C  dihedral,  in degrees
-    ψ (psi)   = N–Cα–C–N  dihedral,  in degrees
+    Built from literature reference points.  C7eq is the global
+    minimum (set to ~0 kJ/mol).  Steric clash zone (φ>0, ψ<0)
+    reaches 30–40 kJ/mol.
 
-    Topology (based on Amber ff14SB / implicit solvent):
-      C7eq  (φ≈−82°, ψ≈ 75°)  — global minimum, 7-membered ring
-      PPII  (φ≈−78°, ψ≈150°)  — polyproline-II / extended
-      C5    (φ≈−158°,ψ≈162°)  — fully extended
-      α_R   (φ≈−63°, ψ≈−43°)  — right-handed α-helix
-      α_L   (φ≈ 58°, ψ≈ 47°)  — left-handed α-helix
-      C7ax  (φ≈ 68°, ψ≈−62°)  — axial C7, shallow
+    Parameters
+    ----------
+    phi, psi : float or ndarray
+        Backbone dihedral angles in degrees.
 
-    Key saddle points between basins at barriers 2–25 kJ/mol.
-    Sterically forbidden regions (φ>0, ψ<0 centre) reach >30 kJ/mol.
+    Returns
+    -------
+    V : float or ndarray
+        Free energy in kJ/mol.
     """
     phi = np.asarray(phi, dtype=float)
     psi = np.asarray(psi, dtype=float)
 
-    # ── Steric exclusion: forbidden Ramachandran regions ──────────
-    # Hard penalties for steric clashes based on allowed-region shape
-    phi_rad = np.deg2rad(phi)
-    psi_rad = np.deg2rad(psi)
-
-    # Broad steric ridge separating left/right half of the map
-    steric = (
-        14.0 * (np.cos(phi_rad + 0.9) + 0.7) * (np.cos(psi_rad - 1.4) + 0.7)
-        + 8.0 * np.cos(2.0 * phi_rad + 0.8)
-        + 5.0 * np.cos(2.0 * psi_rad - 0.3)
-        + 4.0 * np.cos(phi_rad + psi_rad + 0.5)
-    )
-
-    # ── Local basins (periodic 2D Gaussians) ──────────────────────
-    # (φ₀, ψ₀, depth, σ_φ, σ_ψ, correlation ρ)
+    # ── Attractive basins (deep, narrow Gaussians) ────────────────
+    # fmt: off
     basins = [
-        # C7eq — global minimum, γ-turn geometry
-        (-82.0,  75.0, -18.0, 22.0, 22.0,  0.10),
-        # PPII — polyproline-II, extended left-handed
-        (-78.0, 150.0, -15.0, 24.0, 28.0,  0.10),
-        # C5 — fully extended, β-sheet region
-        (-158.0, 162.0, -14.0, 28.0, 30.0, -0.25),
-        # α_R — right-handed α-helix
-        (-63.0, -43.0, -10.0, 18.0, 20.0,  0.20),
-        # β / PII extended region (bridge between C5 and PPII)
-        (-120.0, 118.0, -11.0, 20.0, 25.0,  0.05),
-        # α_L — left-handed α-helix (shallow, rare in nature)
-        (58.0,  47.0,  -3.0, 25.0, 28.0, -0.05),
-        # C7ax — axial, shallow minimum
-        (68.0, -62.0,  -2.0, 22.0, 22.0,  0.00),
+        # (φ₀,  ψ₀,   depth,  σ_φ, σ_ψ)          kJ/mol
+        (-82,   75,   -24.0,  16,  18),   # C7eq  — γ-turn, GLOBAL MIN
+        (-78,  150,   -19.0,  18,  20),   # PPII  — polyproline-II
+        (-160, 165,   -17.0,  20,  22),   # C5    — fully extended / β
+        (-63,  -43,   -13.0,  14,  16),   # α_R   — right-handed α-helix
+        ( 58,   47,    -5.5,  18,  20),   # α_L   — left-handed α-helix
+        ( 68,  -65,    -3.0,  16,  16),   # C7ax  — axial (shallow)
     ]
+    # fmt: on
 
     V = np.zeros_like(phi)
-    for phi0, psi0, depth, s_phi, s_psi, rho in basins:
-        dphi = _pdist(phi, phi0)
-        dpsi = _pdist(psi, psi0)
-        # Bivariate Gaussian with correlation
-        arg = -(
-            dphi ** 2 / (2.0 * s_phi ** 2)
-            + dpsi ** 2 / (2.0 * s_psi ** 2)
-            + rho * dphi * dpsi / (s_phi * s_psi)
-        )
-        V += depth * np.exp(np.clip(arg, -100, 10))
+    for φ0, ψ0, depth, sφ, sψ in basins:
+        dφ = _pwrap(phi - φ0)
+        dψ = _pwrap(psi - ψ0)
+        V += depth * np.exp(-(dφ ** 2 / (2 * sφ ** 2) + dψ ** 2 / (2 * sψ ** 2)))
 
-    return steric + V
+    # ── Repulsive barriers (broad, positive Gaussians) ────────────
+    # fmt: off
+    barriers = [
+        # (φ₀,   ψ₀,  height, σ_φ, σ_ψ)
+        (  0,    0,   30.0,  30,  35),   # central α_R ↔ α_L barrier
+        ( 90,  -80,   38.0,  35,  30),   # steric clash core (φ>0, ψ<0)
+        (130,  -40,   32.0,  30,  25),   # deep steric ridge
+        ( 50,   90,   24.0,  30,  35),   # α_L isolation
+        (  0,  -120,  30.0,  25,  20),   # lower steric
+        (-40,   10,   19.0,  20,  15),   # C7eq ↔ α_R saddle
+        ( 20,   15,   26.0,  25,  30),   # α_R → α_L ridge
+        (  0,   55,   16.0,  40,  25),   # upper central plateau
+    ]
+    # fmt: on
+
+    for φ0, ψ0, height, sφ, sψ in barriers:
+        dφ = _pwrap(phi - φ0)
+        dψ = _pwrap(psi - ψ0)
+        V += height * np.exp(-(dφ ** 2 / (2 * sφ ** 2) + dψ ** 2 / (2 * sψ ** 2)))
+
+    return V + 2.0  # small baseline shift
 
 
 # ═══════════════════════════════════════════════════════════════════
-# Sampling and analysis (same API as before)
+# Sampling & analysis
 # ═══════════════════════════════════════════════════════════════════
 
 def metropolis_sampling(V_func, bounds, n_steps=50000, temp=0.5):
-    """Metropolis MC sampling with periodic boundaries for φ/ψ."""
+    """Metropolis MC with periodic wrapping for φ/ψ."""
     rng = np.random.RandomState(42)
     (x_min, x_max), (y_min, y_max) = bounds
-    period_x = x_max - x_min
-    period_y = y_max - y_min
+    px, py = x_max - x_min, y_max - y_min
 
     x = rng.uniform(x_min, x_max)
     y = rng.uniform(y_min, y_max)
@@ -124,89 +112,65 @@ def metropolis_sampling(V_func, bounds, n_steps=50000, temp=0.5):
     samples = np.zeros((n_steps, 2))
     energies = np.zeros(n_steps)
     accepted = 0
-
-    step_size = 8.0  # degrees — tuned for ~40% acceptance at 300K
+    step = 12.0  # degrees
 
     for i in range(n_steps):
-        x_new = x + rng.normal(0, step_size)
-        y_new = y + rng.normal(0, step_size)
-        # Periodic wrap
-        x_new = (x_new - x_min) % period_x + x_min
-        y_new = (y_new - y_min) % period_y + y_min
-
-        E_new = V_func(x_new, y_new)
-        delta_E = E_new - E
-
-        if delta_E <= 0 or rng.random() < np.exp(-delta_E / temp):
-            x, y = x_new, y_new
-            E = E_new
+        xn = (x + rng.normal(0, step) - x_min) % px + x_min
+        yn = (y + rng.normal(0, step) - y_min) % py + y_min
+        En = V_func(xn, yn)
+        if En <= E or rng.random() < np.exp(-(En - E) / temp):
+            x, y, E = xn, yn, En
             accepted += 1
+        samples[i], energies[i] = [x, y], E
 
-        samples[i] = [x, y]
-        energies[i] = E
-
-    print(f"  MC acceptance rate: {accepted / n_steps:.2%}")
-    print(f"  Energy range: [{energies.min():.1f}, {energies.max():.1f}] kJ/mol")
+    print(f"  MC acceptance: {accepted / n_steps:.1%}")
+    print(f"  Energy range:  [{energies.min():.1f}, {energies.max():.1f}] kJ/mol")
     return samples, energies
 
 
-def find_local_minima(V_func, bounds, n_starts=30):
-    """Multi-start L-BFGS-B to find distinct local minima."""
+def find_local_minima(V_func, bounds, n_starts=40):
+    """Multi-start L-BFGS-B with periodic distance deduplication."""
     (x_min, x_max), (y_min, y_max) = bounds
     rng = np.random.RandomState(123)
-
     minima = []
+
     for _ in range(n_starts):
         x0 = np.array([rng.uniform(x_min, x_max), rng.uniform(y_min, y_max)])
         res = optimize.minimize(
             lambda p: V_func(p[0], p[1]),
-            x0,
-            method="L-BFGS-B",
+            x0, method="L-BFGS-B",
             bounds=[(x_min, x_max), (y_min, y_max)],
         )
-        # Check uniqueness (15° radius for distinct basins)
-        is_new = True
-        for existing in minima:
-            dphi = abs(_pdist(res.x[0], existing[0]))
-            dpsi = abs(_pdist(res.x[1], existing[1]))
-            if dphi < 15.0 and dpsi < 15.0:
-                is_new = False
+        dup = False
+        for m in minima:
+            if all(abs(_pwrap(res.x - m)) < 12.0):
+                dup = True
                 break
-        if is_new:
+        if not dup:
             minima.append(res.x)
-            print(f"  Minimum at (φ={res.x[0]:7.1f}°, ψ={res.x[1]:7.1f}°), "
-                  f"E = {res.fun:.2f} kJ/mol")
+            print(f"  Min  φ={res.x[0]:7.1f}°  ψ={res.x[1]:7.1f}°  "
+                  f"E={res.fun:.1f} kJ/mol")
 
     return np.array(minima)
 
 
-def string_method(V_func, start, end, n_nodes=50, n_iter=300):
-    """
-    Zero-temperature string method with periodic-aware initialisation.
-
-    Initialises the string along the shortest periodic path, then
-    evolves nodes via gradient descent + equal-arc reparameterisation.
-    """
-    # Shortest-path interpolation accounting for periodicity
+def string_method(V_func, start, end, n_nodes=60, n_iter=400):
+    """Zero-temperature string method with periodic-aware init."""
     string = np.zeros((n_nodes, 2))
-    dphi = _pdist(end[0], start[0])
-    dpsi = _pdist(end[1], start[1])
+    dφ = _pwrap(end[0] - start[0])
+    dψ = _pwrap(end[1] - start[1])
     for i in range(n_nodes):
-        alpha = i / (n_nodes - 1)
-        string[i, 0] = start[0] + alpha * dphi
-        string[i, 1] = start[1] + alpha * dpsi
+        α = i / (n_nodes - 1)
+        string[i] = [start[0] + α * dφ, start[1] + α * dψ]
 
-    # Finite-difference gradient
-    eps = 0.5  # degrees — coarser mesh for stability
-
-    dt = 0.5  # gradient descent step size
+    eps, dt = 0.5, 0.8
 
     for _ in range(n_iter):
         for i in range(1, n_nodes - 1):
-            phi, psi = string[i]
-            gphi = (V_func(phi + eps, psi) - V_func(phi - eps, psi)) / (2 * eps)
-            gpsi = (V_func(phi, psi + eps) - V_func(phi, psi - eps)) / (2 * eps)
-            string[i] -= dt * np.array([gphi, gpsi])
+            φ, ψ = string[i]
+            gφ = (V_func(φ + eps, ψ) - V_func(φ - eps, ψ)) / (2 * eps)
+            gψ = (V_func(φ, ψ + eps) - V_func(φ, ψ - eps)) / (2 * eps)
+            string[i] -= dt * np.array([gφ, gψ])
 
         # Reparameterize: equal arc length
         arc = np.zeros(n_nodes)
@@ -215,56 +179,38 @@ def string_method(V_func, start, end, n_nodes=50, n_iter=300):
         if arc[-1] < 1e-10:
             continue
         for i in range(1, n_nodes - 1):
-            target = arc[i] / arc[-1]
+            t = arc[i] / arc[-1]
             for j in range(n_nodes - 1):
-                fj = arc[j] / arc[-1]
-                fn = arc[j + 1] / arc[-1]
-                if fj <= target <= fn:
-                    alpha = (target - fj) / max(fn - fj, 1e-10)
-                    string[i] = string[j] + alpha * (string[j + 1] - string[j])
+                fj, fn = arc[j] / arc[-1], arc[j + 1] / arc[-1]
+                if fj <= t <= fn:
+                    α = (t - fj) / max(fn - fj, 1e-10)
+                    string[i] = string[j] + α * (string[j + 1] - string[j])
                     break
 
     energies = np.array([V_func(p[0], p[1]) for p in string])
     return string, energies
 
 
-def swarm_of_trajectories(V_func, start, n_swarm=30, n_steps=2000, temp=0.5):
-    """
-    Overdamped Langevin swarm from start region to discover pathways.
-
-    dx = −∇V dt + √(2 kB T dt) η
-
-    Periodic boundary reflection keeps trajectories in [-180, 180].
-    """
+def swarm_of_trajectories(V_func, start, n_swarm=40, n_steps=2500, temp=0.5):
+    """Overdamped Langevin swarm with periodic boundaries."""
     rng = np.random.RandomState(77)
-    dt = 0.8
+    dt, eps_fd = 0.8, 2.0
     noise_scale = np.sqrt(2.0 * temp * dt)
-
     x_min, x_max = -180.0, 180.0
     y_min, y_max = -180.0, 180.0
-    eps_fd = 2.0  # finite-difference step (degrees)
 
-    all_paths = []
-    end_points = []
-
-    for s in range(n_swarm):
+    all_paths, end_points = [], []
+    for _ in range(n_swarm):
         pos = start + rng.normal(0, 8.0, 2)
-        pos[0] = (pos[0] - x_min) % 360.0 + x_min
-        pos[1] = (pos[1] - y_min) % 360.0 + y_min
         path = [pos.copy()]
-
         for _ in range(n_steps):
-            phi, psi = pos
-            gphi = (V_func(phi + eps_fd, psi) - V_func(phi - eps_fd, psi)) / (2 * eps_fd)
-            gpsi = (V_func(phi, psi + eps_fd) - V_func(phi, psi - eps_fd)) / (2 * eps_fd)
-
-            noise = rng.normal(0, noise_scale, 2)
-            pos = pos - np.array([gphi, gpsi]) * dt + noise
-            # Periodic wrap
-            pos[0] = (pos[0] - x_min) % 360.0 + x_min
-            pos[1] = (pos[1] - y_min) % 360.0 + y_min
+            φ, ψ = pos
+            gφ = (V_func(φ + eps_fd, ψ) - V_func(φ - eps_fd, ψ)) / (2 * eps_fd)
+            gψ = (V_func(φ, ψ + eps_fd) - V_func(φ, ψ - eps_fd)) / (2 * eps_fd)
+            pos = pos - np.array([gφ, gψ]) * dt + rng.normal(0, noise_scale, 2)
+            pos[0] = (pos[0] - x_min) % 360 + x_min
+            pos[1] = (pos[1] - y_min) % 360 + y_min
             path.append(pos.copy())
-
         all_paths.append(np.array(path))
         end_points.append(pos.copy())
 
@@ -276,69 +222,53 @@ def swarm_of_trajectories(V_func, start, n_swarm=30, n_steps=2000, temp=0.5):
 # ═══════════════════════════════════════════════════════════════════
 
 def run_all():
-    """Main entry: sample, find minima, discover paths."""
     print("=" * 60)
     print("Module B — Adaptive Path Exploration (Alanine Dipeptide FES)")
     print("=" * 60)
 
     bounds = [(-180.0, 180.0), (-180.0, 180.0)]
-    V_func = alanine_dipeptide_fes
+    V = alanine_dipeptide_fes
 
-    # 1. Metropolis sampling
+    # 1. Metropolis
     print("\n[1] Metropolis sampling (50k steps) …")
-    samples, energies = metropolis_sampling(V_func, bounds, n_steps=50000)
+    samples, energies = metropolis_sampling(V, bounds, n_steps=50000)
     np.savez(DATA_DIR / "mb_samples.npz", samples=samples, energies=energies)
-    print(f"  Saved {len(samples)} samples")
+    print(f"  {len(samples)} samples saved")
 
-    # 2. Find minima
+    # 2. Minima
     print("\n[2] Finding local minima …")
-    minima = find_local_minima(V_func, bounds, n_starts=40)
+    minima = find_local_minima(V, bounds, n_starts=40)
     np.save(DATA_DIR / "mb_minima.npy", minima)
-    print(f"  Found {len(minima)} distinct minima")
+    print(f"  {len(minima)} distinct minima found")
 
     # 3. String method
     print("\n[3] String method — minimum free-energy paths …")
-    all_strings = []
-    all_barriers = []
-
+    all_strings, all_barriers = [], []
     for i in range(len(minima)):
         for j in range(i + 1, len(minima)):
-            string, path_energies = string_method(
-                V_func, minima[i], minima[j],
-                n_nodes=60, n_iter=400,
-            )
-            barrier = path_energies.max() - path_energies[0]
+            string, e_path = string_method(V, minima[i], minima[j],
+                                           n_nodes=60, n_iter=400)
+            barrier = e_path.max() - e_path[0]
             print(f"  Path M{i + 1} → M{j + 1}: barrier = {barrier:.1f} kJ/mol")
-            all_strings.append({
-                "start": i,
-                "end": j,
-                "string": string,
-                "energies": path_energies,
-                "barrier": barrier,
-            })
+            all_strings.append(dict(start=i, end=j, string=string,
+                                    energies=e_path, barrier=barrier))
             all_barriers.append(barrier)
-
     np.savez(DATA_DIR / "mb_paths.npz",
              all_strings=all_strings, minima=minima)
 
-    # 4. Swarm-of-trajectories
-    print("\n[4] Swarm-of-trajectories — alternative pathways …")
+    # 4. Swarm
+    print("\n[4] Swarm-of-trajectories …")
     if len(minima) >= 2:
-        energies_at_min = np.array([V_func(m[0], m[1]) for m in minima])
-        start_idx = np.argmax(energies_at_min)  # start from shallowest
-
-        paths, endpoints = swarm_of_trajectories(
-            V_func, minima[start_idx],
-            n_swarm=40, n_steps=2500,
-        )
-        print(f"  {len(paths)} trajectories launched from shallowest minimum")
-        paths_arr = np.empty(len(paths), dtype=object)
+        idx = np.argmax([V(m[0], m[1]) for m in minima])
+        paths, endpoints = swarm_of_trajectories(V, minima[idx],
+                                                 n_swarm=40, n_steps=2500)
+        print(f"  {len(paths)} trajectories from shallowest minimum")
+        arr = np.empty(len(paths), dtype=object)
         for k, p in enumerate(paths):
-            paths_arr[k] = p
-        np.savez(DATA_DIR / "mb_swarm.npz",
-                 paths=paths_arr, endpoints=endpoints)
+            arr[k] = p
+        np.savez(DATA_DIR / "mb_swarm.npz", paths=arr, endpoints=endpoints)
 
-    print("\nModule B complete. Data ready for figure generation.")
+    print("\nModule B complete.")
 
 
 if __name__ == "__main__":

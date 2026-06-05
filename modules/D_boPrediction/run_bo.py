@@ -241,9 +241,9 @@ def train_xgboost(X, y, feature_names, target_names):
             import xgboost as xgb
 
             model = xgb.XGBRegressor(
-                n_estimators=100,
-                max_depth=4,
-                learning_rate=0.1,
+                n_estimators=200,
+                max_depth=6,
+                learning_rate=0.05,
                 subsample=0.8,
                 random_state=42,
             )
@@ -256,7 +256,7 @@ def train_xgboost(X, y, feature_names, target_names):
             print("  (xgboost not available, using RandomForest)")
 
             model = RandomForestRegressor(
-                n_estimators=100, max_depth=6, random_state=42
+                n_estimators=200, max_depth=8, random_state=42
             )
             model.fit(X_train, y_train)
             y_pred = model.predict(X_test)
@@ -302,129 +302,146 @@ def run_bayesian_optimization(X, y, models, feature_names):
 
 def _run_bo_simple(X, y, models, feature_names):
     """
-    Simple GP-based Bayesian optimization.
+    Simple GP-based Bayesian optimization with input normalisation.
 
     Objective: maximize loading_efficiency × structural_stability
               while keeping release_rate in target range.
     """
     rng = np.random.RandomState(99)
 
-    # Use the best target (loading × stability) as optimization objective
-    # We're optimizing over the DESIGN SPACE, not the dataset
     y_obj = y[:, 0] * y[:, 2]  # loading × stability
 
     n_features = X.shape[1]
-    bounds = np.zeros((n_features, 2))
-    for fi in range(n_features):
-        bounds[fi] = [X[:, fi].min(), X[:, fi].max()]
+    # ── Global min-max bounds for the design space ──
+    x_min = X.min(axis=0)
+    x_max = X.max(axis=0)
+    # Normalise everything to [0, 1]
+    def normalise(x):
+        return (x - x_min) / (x_max - x_min + 1e-10)
+    def denormalise(xn):
+        return xn * (x_max - x_min) + x_min
 
-    # Initial samples
-    n_init = 10
-    X_tested = X[:n_init].copy()
-    y_tested = y_obj[:n_init].copy()
+    X_norm_global = normalise(X)
+
+    # ── Initial samples: random over the space ──
+    n_init = 20
+    init_idx = rng.choice(len(X), n_init, replace=False)
+    X_tested = X_norm_global[init_idx].copy()
+    y_tested = y_obj[init_idx].copy()
 
     best_y = y_tested.max()
-    best_x = X_tested[y_tested.argmax()]
+    best_x_norm = X_tested[y_tested.argmax()].copy()
 
     history = [best_y]
-    n_iter = 30
+    n_iter = 100
+    n_candidates = 5000
+    gp_ls = 0.3  # RBF lengthscale in normalised space
 
     for iteration in range(n_iter):
-        # Fit simple GP: use RBF kernel on normalized features
-        X_norm = (X_tested - X_tested.mean(0)) / (X_tested.std(0) + 1e-8)
+        # Adaptive UCB beta: start explorative, become exploitative
+        beta = 3.0 * (1.0 - 0.7 * iteration / n_iter)
 
-        # Predict on random candidates
-        candidates = rng.uniform(
-            bounds[:, 0], bounds[:, 1], (1000, n_features)
-        )
-        cand_norm = (candidates - X_tested.mean(0)) / (
-            X_tested.std(0) + 1e-8
-        )
+        # Generate candidates in normalised space
+        cand_norm = rng.uniform(0, 1, (n_candidates, n_features))
 
-        # GP prediction: weighted average
         best_acq = -float("inf")
-        best_candidate = None
+        best_cand_norm = None
 
-        for cand, cand_n in zip(candidates, cand_norm):
-            # Distance to all known points
-            distances = ((X_norm - cand_n) ** 2).sum(axis=1)
-            weights = np.exp(-distances / (2.0 * 0.5 ** 2))
-            weights = weights / weights.sum()
+        for cand in cand_norm:
+            distances = ((X_tested - cand) ** 2).sum(axis=1)
+            weights = np.exp(-distances / (2.0 * gp_ls ** 2))
+            w_sum = weights.sum()
+            if w_sum < 1e-10:
+                pred_mean, pred_std = 0.0, 1.0
+            else:
+                weights = weights / w_sum
+                pred_mean = (y_tested * weights).sum()
+                var = (y_tested ** 2 * weights).sum() - pred_mean ** 2
+                pred_std = np.sqrt(max(1e-10, var))
 
-            pred_mean = (y_tested * weights).sum()
-            var = (y_tested ** 2 * weights).sum() - pred_mean ** 2
-            pred_std = np.sqrt(max(0.0, var))
-
-            # UCB
-            acq = pred_mean + 1.5 * pred_std
-
+            acq = pred_mean + beta * pred_std
             if acq > best_acq:
                 best_acq = acq
-                best_candidate = cand.copy()
+                best_cand_norm = cand.copy()
 
-        # Evaluate using trained XGBoost models
-        new_features = best_candidate.reshape(1, -1)
+        # Evaluate candidate using trained XGBoost models
+        new_features = denormalise(best_cand_norm.reshape(1, -1))
         pred_loading = models[0].predict(new_features)[0]
         pred_stability = models[2].predict(new_features)[0]
         new_y = pred_loading * pred_stability
 
-        X_tested = np.vstack([X_tested, best_candidate])
+        X_tested = np.vstack([X_tested, best_cand_norm])
         y_tested = np.append(y_tested, new_y)
 
         if new_y > best_y:
             best_y = new_y
-            best_x = best_candidate.copy()
+            best_x_norm = best_cand_norm.copy()
 
         history.append(best_y)
 
-        if iteration % 10 == 0:
-            print(f"  BO iter {iteration:3d}: best = {best_y:.4f}")
+        if iteration % 20 == 0:
+            print(f"  BO iter {iteration:3d}: best = {best_y:.4f}, beta = {beta:.2f}")
 
+    best_x = denormalise(best_x_norm)
     print(f"\n  Best objective: {best_y:.4f}")
     print(f"  Best parameters: {dict(zip(feature_names, best_x.round(4)))}")
 
-    # Also predict individual targets
     bx = best_x.reshape(1, -1)
     preds = [m.predict(bx)[0] for m in models]
-    print(f"  Predicted loading: {preds[0]:.3f}")
+    print(f"  Predicted loading:   {preds[0]:.3f}")
+    print(f"  Predicted release:   {preds[1]:.3f}")
     print(f"  Predicted stability: {preds[2]:.3f}")
 
     return history, best_x, preds
 
 
 def _run_bo_botorch(X, y, models, feature_names):
-    """BoTorch-based BO (if library available)."""
+    """BoTorch-based BO with normalised inputs and more iterations."""
     import torch
+    import warnings
     from botorch.models import SingleTaskGP
     from botorch.acquisition import UpperConfidenceBound
     from botorch.optim import optimize_acqf
 
+    # Suppress BoTorch input warnings
+    warnings.filterwarnings("ignore", category=UserWarning, module="botorch")
+
     y_obj = y[:, 0] * y[:, 2]  # objective
 
     n_features = X.shape[1]
+    x_min = X.min(axis=0)
+    x_max = X.max(axis=0)
+
+    # Normalise to [0, 1]
+    X_norm = (X - x_min) / (x_max - x_min + 1e-10)
     bounds_t = torch.stack([
-        torch.tensor(X.min(0)),
-        torch.tensor(X.max(0)),
+        torch.zeros(n_features, dtype=torch.float64),
+        torch.ones(n_features, dtype=torch.float64),
     ])
 
-    X_t = torch.tensor(X[:20], dtype=torch.float64)
-    y_t = torch.tensor(y_obj[:20], dtype=torch.float64).reshape(-1, 1)
+    rng = np.random.RandomState(99)
+    init_idx = rng.choice(len(X_norm), 20, replace=False)
+    X_t = torch.tensor(X_norm[init_idx], dtype=torch.float64)
+    y_t = torch.tensor(y_obj[init_idx], dtype=torch.float64).reshape(-1, 1)
 
     best_y = y_t.max().item()
+    best_x_norm = X_t[y_t.argmax()].clone()
     history = [best_y]
 
-    for iteration in range(30):
+    for iteration in range(80):
         model = SingleTaskGP(X_t, y_t)
-        acq = UpperConfidenceBound(model, beta=1.0)
+        beta = 3.0 * (1.0 - 0.7 * iteration / 80)
+        acq = UpperConfidenceBound(model, beta=beta)
 
         candidate, _ = optimize_acqf(
-            acq, bounds=bounds_t, q=1, num_restarts=5, raw_samples=50,
+            acq, bounds=bounds_t, q=1, num_restarts=10, raw_samples=200,
         )
 
-        # Evaluate
+        # Denormalise and evaluate
+        cand_np = candidate.numpy().flatten() * (x_max - x_min) + x_min
         with torch.no_grad():
-            pred_loading = models[0].predict(candidate.numpy())[0]
-            pred_stability = models[2].predict(candidate.numpy())[0]
+            pred_loading = models[0].predict(cand_np.reshape(1, -1))[0]
+            pred_stability = models[2].predict(cand_np.reshape(1, -1))[0]
         new_y = pred_loading * pred_stability
 
         X_t = torch.cat([X_t, candidate])
@@ -432,12 +449,15 @@ def _run_bo_botorch(X, y, models, feature_names):
 
         if new_y > best_y:
             best_y = new_y
+            best_x_norm = candidate.clone()
 
         history.append(best_y)
-        if iteration % 10 == 0:
-            print(f"  BO iter {iteration:3d}: best = {best_y:.4f}")
+        if iteration % 20 == 0:
+            print(f"  BO iter {iteration:3d}: best = {best_y:.4f}, beta = {beta:.2f}")
 
-    return history, candidate.numpy().flatten(), [pred_loading, 0, pred_stability]
+    best_x = best_x_norm.numpy().flatten() * (x_max - x_min) + x_min
+    preds = [m.predict(best_x.reshape(1, -1))[0] for m in models]
+    return history, best_x, preds
 
 
 def run_all():
