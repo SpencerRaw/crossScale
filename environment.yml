@@ -1,0 +1,26 @@
+name: crossScale
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - openmm
+  - plumed
+  - py-plumed
+  - deeptime
+  - mdanalysis
+  - mdtraj
+  - pip
+  - pip:
+    - torch
+    - botorch
+    - ax-platform
+    - xgboost
+    - rdkit
+    - dscribe
+    - gymnasium
+    - stable-baselines3
