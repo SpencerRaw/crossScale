@@ -29,8 +29,8 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # ── Periodic distance helper ──────────────────────────────────────
 def _pdist(a, b, period=360.0):
     """Shortest signed distance on a circle with given period."""
-    d = (a - b) % period
-    d[d > period / 2] -= period
+    d = (np.asarray(a) - np.asarray(b)) % period
+    d = np.where(d > period / 2, d - period, d)
     return d
 
 
