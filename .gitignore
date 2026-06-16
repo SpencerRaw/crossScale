@@ -4,6 +4,9 @@ __pycache__/
 *.pyo
 *.egg-info/
 
+# Claude / local settings
+.claude/
+
 # Generated data (trajectories, trained models, CSVs)
 data/*
 !data/.gitkeep
@@ -18,5 +21,8 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Keep environment.yml for Colab setup
+# Conda / env
+.conda/
+
+# Keep environment.yml for setup
 !environment.yml

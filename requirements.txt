@@ -1,0 +1,14 @@
+numpy
+scipy
+matplotlib
+pandas
+openmm
+torch
+botorch
+ax-platform
+xgboost
+deeptime
+mdanalysis
+mdtraj
+gymnasium
+stable-baselines3
